@@ -408,6 +408,22 @@ def select_named_track(tracks: list[TrackData], expected_name: str) -> TrackData
     return matches[0]
 
 
+def validate_required_track_set(tracks: list[TrackData]) -> None:
+    available = ", ".join(track.name or "<unnamed>" for track in tracks)
+    expected = {"melody", "chord"}
+    normalized_names = {
+        track.name.strip().lower()
+        for track in tracks
+        if track.name is not None
+    }
+
+    if len(tracks) != 2 or normalized_names != expected:
+        raise MidiValidationError(
+            "MIDI must contain exactly two tracks named 'melody' and 'chord'. "
+            f"Found {len(tracks)} track(s): {available}"
+        )
+
+
 def convert_notes(
     raw_notes: list[RawNote],
     ticks_per_beat: int,
@@ -508,6 +524,7 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 def convert_midi_to_json(input_path: Path, output_root: Path, tolerance: float) -> Path:
     ticks_per_beat, tracks, tempo_events, time_signature_events = parse_midi(input_path)
 
+    validate_required_track_set(tracks)
     melody_track = select_named_track(tracks, "melody")
     chord_track = select_named_track(tracks, "chord")
 
@@ -592,4 +609,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
