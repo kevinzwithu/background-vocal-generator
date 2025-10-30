@@ -497,6 +497,52 @@ def validate_chord_alignment(notes: list[dict[str, Any]], tolerance: float) -> N
                 )
 
 
+def validate_no_overlapping_notes(
+    notes: list[dict[str, Any]],
+    track_label: str,
+    tolerance: float,
+) -> None:
+    previous: dict[str, Any] | None = None
+    previous_end = 0.0
+
+    for note in sorted(
+        notes,
+        key=lambda item: (float(item["time"]), float(item["duration"]), item["midi"]),
+    ):
+        start = float(note["time"])
+        end = start + float(note["duration"])
+        if previous is not None and start < previous_end - tolerance:
+            raise MidiValidationError(
+                f"{track_label}: overlapping notes are not allowed. "
+                f"{previous['name']}@{previous['time']}+{previous['duration']} overlaps "
+                f"{note['name']}@{note['time']}+{note['duration']}."
+            )
+        previous = note
+        previous_end = max(previous_end, end)
+
+
+def filter_non_chord_groups(
+    notes: list[dict[str, Any]],
+    tolerance: float,
+) -> list[dict[str, Any]]:
+    grouped_notes: dict[float, list[dict[str, Any]]] = {}
+    for note in notes:
+        start = float(note["time"])
+        key = round(start / max(tolerance, 1e-9)) * max(tolerance, 1e-9)
+        grouped_notes.setdefault(key, []).append(note)
+
+    chord_notes: list[dict[str, Any]] = []
+    for group in grouped_notes.values():
+        pitch_classes = {int(note["midi"]) % 12 for note in group}
+        if len(pitch_classes) > 1:
+            chord_notes.extend(group)
+
+    return sorted(
+        chord_notes,
+        key=lambda item: (float(item["time"]), float(item["duration"]), item["midi"]),
+    )
+
+
 def build_header(
     melody_notes: list[dict[str, Any]],
     chord_notes: list[dict[str, Any]],
@@ -547,6 +593,8 @@ def convert_midi_to_json(input_path: Path, output_root: Path, tolerance: float) 
         "chord",
     )
     validate_chord_alignment(chord_notes, tolerance)
+    validate_no_overlapping_notes(melody_notes, "melody", tolerance)
+    chord_notes = filter_non_chord_groups(chord_notes, tolerance)
 
     header = build_header(melody_notes, chord_notes, tempo_map, time_signature_map)
     canonical = {"header": header, "melody": melody_notes, "chord": chord_notes}

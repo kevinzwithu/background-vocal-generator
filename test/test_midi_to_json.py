@@ -107,6 +107,9 @@ class MidiToJsonTest(unittest.TestCase):
                 track_chunk(
                     " Chord ",
                     [
+                        (0, TICKS_PER_BEAT, 48),
+                        (0, TICKS_PER_BEAT, 60),
+                        (0, TICKS_PER_BEAT, 72),
                         (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 48),
                         (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 52),
                         (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 55),
@@ -219,6 +222,65 @@ class MidiToJsonTest(unittest.TestCase):
             input_path.write_bytes(midi_bytes)
             with self.assertRaisesRegex(midi_to_json.MidiValidationError, "must end together"):
                 midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_rejects_overlapping_melody_notes(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [
+                        (0, TICKS_PER_BEAT * 2, 60),
+                        (TICKS_PER_BEAT, TICKS_PER_BEAT * 3, 62),
+                    ],
+                ),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT * 2, 48),
+                        (0, TICKS_PER_BEAT * 2, 52),
+                    ],
+                ),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "overlapping notes"):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_filters_chord_groups_that_are_not_real_chords(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT * 3, 60)]),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT, 48),
+                        (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 48),
+                        (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 60),
+                        (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 72),
+                        (TICKS_PER_BEAT * 2, TICKS_PER_BEAT * 3, 48),
+                        (TICKS_PER_BEAT * 2, TICKS_PER_BEAT * 3, 52),
+                    ],
+                ),
+            ]
+        )
+
+        canonical, output_dir, _ = self.convert(midi_bytes)
+
+        self.assertEqual(
+            canonical["chord"],
+            [
+                {"name": "C3", "midi": 48, "time": 2, "duration": 1, "bar": 1, "beat": 3, "grid": 8},
+                {"name": "E3", "midi": 52, "time": 2, "duration": 1, "bar": 1, "beat": 3, "grid": 8},
+            ],
+        )
+        self.assertEqual(
+            json.loads((output_dir / "chord.json").read_text(encoding="utf-8"))["chord"],
+            canonical["chord"],
+        )
 
 
 if __name__ == "__main__":
