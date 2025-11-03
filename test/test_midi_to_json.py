@@ -168,24 +168,89 @@ class MidiToJsonTest(unittest.TestCase):
 
     def test_rejects_any_track_set_other_than_exactly_melody_and_chord(self) -> None:
         cases = [
-            ("extra track", ["melody", "chord", "extra"]),
-            ("wrong track name", ["melody", "bass"]),
-            ("unnamed track", ["melody", None]),
-            ("duplicate melody", ["melody", "melody"]),
+            (
+                "extra track",
+                [
+                    ("melody", [(0, TICKS_PER_BEAT, 60)]),
+                    ("chord", [(0, TICKS_PER_BEAT, 48), (0, TICKS_PER_BEAT, 52)]),
+                    ("extra", [(0, TICKS_PER_BEAT, 64)]),
+                ],
+            ),
+            (
+                "wrong track name",
+                [
+                    ("melody", [(0, TICKS_PER_BEAT, 60)]),
+                    ("bass", [(0, TICKS_PER_BEAT, 48)]),
+                ],
+            ),
+            (
+                "unnamed track",
+                [
+                    ("melody", [(0, TICKS_PER_BEAT, 60)]),
+                    (None, [(0, TICKS_PER_BEAT, 48)]),
+                ],
+            ),
+            (
+                "duplicate melody",
+                [
+                    ("melody", [(0, TICKS_PER_BEAT, 60)]),
+                    ("melody", [(TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 62)]),
+                ],
+            ),
         ]
 
-        for label, track_names in cases:
+        for label, tracks in cases:
             with self.subTest(label=label):
-                midi_bytes = midi_file([track_chunk(name, []) for name in track_names])
+                midi_bytes = midi_file([track_chunk(name, notes) for name, notes in tracks])
                 with TemporaryDirectory() as temp_dir:
                     root = Path(temp_dir)
                     input_path = root / "song.mid"
                     input_path.write_bytes(midi_bytes)
                     with self.assertRaisesRegex(
                         midi_to_json.MidiValidationError,
-                        "exactly two tracks named 'melody' and 'chord'",
+                        "exactly two non-empty tracks named 'melody' and 'chord'",
                     ):
                         midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_ignores_empty_tracks_including_duplicate_names(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [], [(0, 0x51, tempo_payload(100))]),
+                track_chunk("chord", [], [(0, 0x58, time_signature_payload(4, 2))]),
+                track_chunk("melody", [(0, TICKS_PER_BEAT, 60)]),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT, 48),
+                        (0, TICKS_PER_BEAT, 52),
+                    ],
+                ),
+                track_chunk("unused", []),
+                track_chunk(None, []),
+            ]
+        )
+
+        canonical, _, stderr = self.convert(midi_bytes)
+
+        self.assertEqual(stderr, "")
+        self.assertEqual(canonical["header"]["tempoMap"], [{"time": 0, "bpm": 100}])
+        self.assertEqual(
+            canonical["header"]["timeSignatureMap"],
+            [{"time": 0, "numerator": 4, "denominator": 4}],
+        )
+        self.assertEqual(
+            canonical["melody"],
+            [
+                {"name": "C4", "midi": 60, "time": 0, "duration": 1, "bar": 1, "beat": 1, "grid": 0},
+            ],
+        )
+        self.assertEqual(
+            canonical["chord"],
+            [
+                {"name": "C3", "midi": 48, "time": 0, "duration": 1, "bar": 1, "beat": 1, "grid": 0},
+                {"name": "E3", "midi": 52, "time": 0, "duration": 1, "bar": 1, "beat": 1, "grid": 0},
+            ],
+        )
 
     def test_rejects_unquantized_notes(self) -> None:
         midi_bytes = midi_file(

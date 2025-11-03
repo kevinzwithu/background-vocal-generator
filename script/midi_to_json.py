@@ -408,6 +408,10 @@ def select_named_track(tracks: list[TrackData], expected_name: str) -> TrackData
     return matches[0]
 
 
+def non_empty_tracks(tracks: list[TrackData]) -> list[TrackData]:
+    return [track for track in tracks if track.notes]
+
+
 def validate_required_track_set(tracks: list[TrackData]) -> None:
     available = ", ".join(track.name or "<unnamed>" for track in tracks)
     expected = {"melody", "chord"}
@@ -419,8 +423,8 @@ def validate_required_track_set(tracks: list[TrackData]) -> None:
 
     if len(tracks) != 2 or normalized_names != expected:
         raise MidiValidationError(
-            "MIDI must contain exactly two tracks named 'melody' and 'chord'. "
-            f"Found {len(tracks)} track(s): {available}"
+            "MIDI must contain exactly two non-empty tracks named 'melody' and 'chord'. "
+            f"Found {len(tracks)} non-empty track(s): {available}"
         )
 
 
@@ -569,10 +573,11 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def convert_midi_to_json(input_path: Path, output_root: Path, tolerance: float) -> Path:
     ticks_per_beat, tracks, tempo_events, time_signature_events = parse_midi(input_path)
+    music_tracks = non_empty_tracks(tracks)
 
-    validate_required_track_set(tracks)
-    melody_track = select_named_track(tracks, "melody")
-    chord_track = select_named_track(tracks, "chord")
+    validate_required_track_set(music_tracks)
+    melody_track = select_named_track(music_tracks, "melody")
+    chord_track = select_named_track(music_tracks, "chord")
 
     tempo_map = normalize_tempo_map(tempo_events, ticks_per_beat)
     time_signature_map = normalize_time_signature_map(time_signature_events, ticks_per_beat)
