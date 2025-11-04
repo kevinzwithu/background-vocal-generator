@@ -18,6 +18,8 @@ from typing import Any
 
 C0_MIDI = 12
 C6_MIDI = 84
+MAX_BARS = 250
+MAX_SECONDS = 8 * 60
 PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
 
@@ -547,6 +549,92 @@ def filter_non_chord_groups(
     )
 
 
+def group_notes_by_start(
+    notes: list[dict[str, Any]],
+    tolerance: float,
+) -> list[list[dict[str, Any]]]:
+    grouped_notes: dict[float, list[dict[str, Any]]] = {}
+    for note in notes:
+        start = float(note["time"])
+        key = round(start / max(tolerance, 1e-9)) * max(tolerance, 1e-9)
+        grouped_notes.setdefault(key, []).append(note)
+    return [grouped_notes[key] for key in sorted(grouped_notes)]
+
+
+def note_end(note: dict[str, Any]) -> float:
+    return float(note["time"]) + float(note["duration"])
+
+
+def count_bars(duration: float, segments: list[TimeSignatureSegment]) -> int:
+    if duration <= 0:
+        return 0
+
+    bar_count = 0
+    for index, segment in enumerate(segments):
+        next_start = segments[index + 1].start if index + 1 < len(segments) else duration
+        segment_end = min(duration, next_start)
+        if segment_end <= segment.start:
+            continue
+        elapsed = segment_end - segment.start
+        bar_count += math.ceil((elapsed - 1e-9) / segment.bar_length)
+        if duration <= next_start:
+            break
+    return bar_count
+
+
+def duration_seconds(duration: float, tempo_map: list[dict[str, Any]]) -> float:
+    seconds = 0.0
+    for index, item in enumerate(tempo_map):
+        start = float(item["time"])
+        if start >= duration:
+            break
+        end = float(tempo_map[index + 1]["time"]) if index + 1 < len(tempo_map) else duration
+        segment_end = min(duration, end)
+        if segment_end <= start:
+            continue
+        seconds += (segment_end - start) * 60 / int(item["bpm"])
+    return seconds
+
+
+def validate_piece_limits(
+    melody_notes: list[dict[str, Any]],
+    chord_notes: list[dict[str, Any]],
+    tempo_map: list[dict[str, Any]],
+    segments: list[TimeSignatureSegment],
+    duration: float,
+    tolerance: float,
+) -> None:
+    if not melody_notes:
+        raise MidiValidationError("Melody track must contain at least one valid note.")
+    if not chord_notes:
+        raise MidiValidationError("Chord track must contain at least one valid chord.")
+
+    bar_count = count_bars(duration, segments)
+    if bar_count > MAX_BARS:
+        raise MidiValidationError(
+            f"MIDI length must not exceed {MAX_BARS} bars. Found {bar_count} bars."
+        )
+
+    seconds = duration_seconds(duration, tempo_map)
+    if seconds > MAX_SECONDS + tolerance:
+        raise MidiValidationError(
+            f"MIDI length must not exceed 8 minutes. Found {round(seconds, 2)} seconds."
+        )
+
+    for group in group_notes_by_start(chord_notes, tolerance):
+        chord_start = min(float(note["time"]) for note in group)
+        chord_end = max(note_end(note) for note in group)
+        for melody in melody_notes:
+            melody_start = float(melody["time"])
+            melody_end = note_end(melody)
+            if melody_start < chord_end - tolerance and melody_end > chord_start + tolerance:
+                return
+
+    raise MidiValidationError(
+        "Chord track must contain at least one valid chord whose time range overlaps a melody note."
+    )
+
+
 def build_header(
     melody_notes: list[dict[str, Any]],
     chord_notes: list[dict[str, Any]],
@@ -602,6 +690,14 @@ def convert_midi_to_json(input_path: Path, output_root: Path, tolerance: float) 
     chord_notes = filter_non_chord_groups(chord_notes, tolerance)
 
     header = build_header(melody_notes, chord_notes, tempo_map, time_signature_map)
+    validate_piece_limits(
+        melody_notes,
+        chord_notes,
+        tempo_map,
+        segments,
+        float(header["duration"]),
+        tolerance,
+    )
     canonical = {"header": header, "melody": melody_notes, "chord": chord_notes}
 
     work_name = input_path.stem

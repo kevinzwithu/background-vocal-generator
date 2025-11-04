@@ -347,6 +347,116 @@ class MidiToJsonTest(unittest.TestCase):
             canonical["chord"],
         )
 
+    def test_rejects_when_melody_has_no_valid_notes_after_filtering(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT, 11)]),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT, 48),
+                        (0, TICKS_PER_BEAT, 52),
+                    ],
+                ),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "Melody track"):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_rejects_when_chord_has_no_valid_chords_after_filtering(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT, 60)]),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT, 48),
+                        (0, TICKS_PER_BEAT, 60),
+                        (0, TICKS_PER_BEAT, 72),
+                    ],
+                ),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "at least one valid chord"):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_rejects_when_no_valid_chord_overlaps_melody(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT, 60)]),
+                track_chunk(
+                    "chord",
+                    [
+                        (TICKS_PER_BEAT * 2, TICKS_PER_BEAT * 3, 48),
+                        (TICKS_PER_BEAT * 2, TICKS_PER_BEAT * 3, 52),
+                    ],
+                ),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "overlaps a melody note"):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_rejects_when_midi_exceeds_250_bars(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [(0, TICKS_PER_BEAT * 4 * 251, 60)],
+                    [(0, 0x51, tempo_payload(240))],
+                ),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT * 4 * 251, 48),
+                        (0, TICKS_PER_BEAT * 4 * 251, 52),
+                    ],
+                ),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "250 bars"):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_rejects_when_midi_exceeds_8_minutes(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT * 4 * 249, 60)]),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT * 4 * 249, 48),
+                        (0, TICKS_PER_BEAT * 4 * 249, 52),
+                    ],
+                ),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "8 minutes"):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
 
 if __name__ == "__main__":
     unittest.main()
