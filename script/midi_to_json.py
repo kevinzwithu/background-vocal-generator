@@ -21,6 +21,14 @@ C6_MIDI = 84
 MAX_BARS = 250
 MAX_SECONDS = 8 * 60
 PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+CONTROL_SECTIONS = {
+    0: "verse",
+    1: "pre_chorus",
+    2: "chorus",
+    3: "bridge",
+    4: "no_bv",
+}
+CONTROL_OCTAVE_BASES = (0, 12)
 
 
 class MidiParseError(Exception):
@@ -416,18 +424,29 @@ def non_empty_tracks(tracks: list[TrackData]) -> list[TrackData]:
 
 def validate_required_track_set(tracks: list[TrackData]) -> None:
     available = ", ".join(track.name or "<unnamed>" for track in tracks)
-    expected = {"melody", "chord"}
-    normalized_names = {
+    normalized_names = [
         track.name.strip().lower()
         for track in tracks
         if track.name is not None
-    }
+    ]
 
-    if len(tracks) != 2 or normalized_names != expected:
+    if normalized_names.count("melody") != 1 or normalized_names.count("chord") != 1:
         raise MidiValidationError(
-            "MIDI must contain exactly two non-empty tracks named 'melody' and 'chord'. "
+            "MIDI must contain exactly one non-empty track named 'melody' and exactly one "
+            "non-empty track named 'chord'. "
             f"Found {len(tracks)} non-empty track(s): {available}"
         )
+    if normalized_names.count("control") > 1:
+        raise MidiValidationError("MIDI must not contain more than one non-empty 'control' track.")
+
+
+def optional_named_track(tracks: list[TrackData], expected_name: str) -> TrackData | None:
+    matches = [
+        track
+        for track in tracks
+        if track.name is not None and track.name.strip().lower() == expected_name.lower()
+    ]
+    return matches[0] if matches else None
 
 
 def convert_notes(
@@ -480,6 +499,84 @@ def convert_notes(
         )
 
     return output, filtered
+
+
+def convert_control_notes(
+    raw_notes: list[RawNote],
+    ticks_per_beat: int,
+    segments: list[TimeSignatureSegment],
+    duration: float,
+    tolerance: float,
+) -> list[dict[str, Any]]:
+    starts: list[tuple[float, RawNote]] = []
+    intervals: list[tuple[float, float, RawNote]] = []
+    for raw in sorted(raw_notes, key=lambda item: (item.start_ticks, item.midi)):
+        section = CONTROL_SECTIONS.get(raw.midi % 12)
+        if section is None or raw.midi - raw.midi % 12 not in CONTROL_OCTAVE_BASES:
+            raise MidiValidationError(
+                "control: only C/C#/D/D#/E at MIDI 0-4 or 12-16 are supported."
+            )
+        start = ticks_to_beats(raw.start_ticks, ticks_per_beat)
+        end = ticks_to_beats(raw.end_ticks, ticks_per_beat)
+        if end <= start + tolerance:
+            raise MidiValidationError("control: section notes must have positive duration.")
+        ok, segment, nearest = quantization_details(segments, start, tolerance)
+        if not ok:
+            raise MidiValidationError(
+                f"control: unquantized start for {midi_name(raw.midi)}. "
+                f"time={normalize_number(start)} beats, "
+                f"nearest={normalize_number(nearest)} beats, "
+                f"timeSignature={segment.numerator}/{segment.denominator}."
+            )
+        ok, segment, nearest = quantization_details(segments, end, tolerance)
+        if not ok:
+            raise MidiValidationError(
+                f"control: unquantized end for {midi_name(raw.midi)}. "
+                f"time={normalize_number(end)} beats, "
+                f"nearest={normalize_number(nearest)} beats, "
+                f"timeSignature={segment.numerator}/{segment.denominator}."
+            )
+        starts.append((start, raw))
+        intervals.append((start, end, raw))
+
+    previous_interval: tuple[float, float, RawNote] | None = None
+    for start, end, raw in sorted(intervals, key=lambda item: (item[0], item[1], item[2].midi)):
+        if previous_interval is not None:
+            previous_start, previous_end, previous_raw = previous_interval
+            if start < previous_end - tolerance:
+                raise MidiValidationError(
+                    "control: section notes must not overlap. "
+                    f"{midi_name(previous_raw.midi)}@{normalize_number(previous_start)}-"
+                    f"{normalize_number(previous_end)} overlaps "
+                    f"{midi_name(raw.midi)}@{normalize_number(start)}-"
+                    f"{normalize_number(end)}."
+                )
+        if previous_interval is None or end > previous_interval[1]:
+            previous_interval = (start, end, raw)
+
+    output: list[dict[str, Any]] = []
+    previous_start: float | None = None
+    for index, (start, raw) in enumerate(starts):
+        if previous_start is not None and abs(start - previous_start) <= tolerance:
+            raise MidiValidationError("control: only one section note may start at the same time.")
+        next_start = starts[index + 1][0] if index + 1 < len(starts) else duration
+        if next_start <= start + tolerance:
+            raise MidiValidationError("control: section notes must start before the song ends.")
+        bar, beat, grid = bar_position(segments, start)
+        output.append(
+            {
+                "section": CONTROL_SECTIONS[raw.midi % 12],
+                "name": midi_name(raw.midi),
+                "midi": raw.midi,
+                "time": normalize_number(start),
+                "duration": normalize_number(next_start - start),
+                "bar": bar,
+                "beat": beat,
+                "grid": grid,
+            }
+        )
+        previous_start = start
+    return output
 
 
 def validate_chord_alignment(notes: list[dict[str, Any]], tolerance: float) -> None:
@@ -666,6 +763,7 @@ def convert_midi_to_json(input_path: Path, output_root: Path, tolerance: float) 
     validate_required_track_set(music_tracks)
     melody_track = select_named_track(music_tracks, "melody")
     chord_track = select_named_track(music_tracks, "chord")
+    control_track = optional_named_track(music_tracks, "control")
 
     tempo_map = normalize_tempo_map(tempo_events, ticks_per_beat)
     time_signature_map = normalize_time_signature_map(time_signature_events, ticks_per_beat)
@@ -698,14 +796,29 @@ def convert_midi_to_json(input_path: Path, output_root: Path, tolerance: float) 
         float(header["duration"]),
         tolerance,
     )
+    control_notes = (
+        convert_control_notes(
+            control_track.notes,
+            ticks_per_beat,
+            segments,
+            float(header["duration"]),
+            tolerance,
+        )
+        if control_track is not None
+        else []
+    )
     canonical = {"header": header, "melody": melody_notes, "chord": chord_notes}
+    melody_payload = {"header": header, "melody": melody_notes}
+    if control_notes:
+        canonical["control"] = control_notes
+        melody_payload["control"] = control_notes
 
     work_name = input_path.stem
     output_dir = output_root / work_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     write_json(output_dir / "canonical.json", canonical)
-    write_json(output_dir / "melody.json", {"header": header, "melody": melody_notes})
+    write_json(output_dir / "melody.json", melody_payload)
     write_json(output_dir / "chord.json", {"header": header, "chord": chord_notes})
 
     if filtered_melody or filtered_chord:

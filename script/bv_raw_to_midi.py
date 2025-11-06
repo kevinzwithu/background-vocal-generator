@@ -17,13 +17,21 @@ C0_MIDI = 12
 C6_MIDI = 84
 EXPECTED_TRACKS = (
     "LeadDouble",
-    "HighHarmonyA",
-    "HighHarmonyB",
-    "LowHarmony",
+    "HHA",
+    "HHB",
+    "HHF",
+    "LHA",
+    "LHB",
+    "LHF",
     "VocalPad1",
     "VocalPad2",
     "VocalPad3",
+    "VocalPad4",
 )
+
+MELODY_ALIGNED_TRACKS = ("HHA", "HHB", "HHF", "LHA", "LHB", "LHF")
+HIGH_HARMONY_TRACKS = ("HHA", "HHB", "HHF")
+LOW_HARMONY_TRACKS = ("LHA", "LHB", "LHF")
 
 
 class BvMidiError(Exception):
@@ -45,9 +53,33 @@ def normalize_number(value: float, digits: int = 6) -> int | float:
     return round(value, digits)
 
 
+def require_number(item: dict[str, Any], key: str, label: str) -> float:
+    if key not in item:
+        raise BvMidiError(f"{label} is missing '{key}'.")
+    try:
+        return float(item[key])
+    except (TypeError, ValueError) as exc:
+        raise BvMidiError(f"{label}.{key} must be a number.") from exc
+
+
+def require_int(item: dict[str, Any], key: str, label: str) -> int:
+    if key not in item:
+        raise BvMidiError(f"{label} is missing '{key}'.")
+    try:
+        return int(item[key])
+    except (TypeError, ValueError) as exc:
+        raise BvMidiError(f"{label}.{key} must be an integer.") from exc
+
+
 def read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise BvMidiError(f"Input JSON file does not exist: {path}")
+    if not path.is_file():
+        raise BvMidiError(f"Input JSON path is not a file: {path}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise BvMidiError(f"Unable to read JSON file {path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise BvMidiError(f"Invalid JSON file {path}: {exc}") from exc
     if not isinstance(payload, dict):
@@ -66,6 +98,28 @@ def sibling_header(bv_path: Path) -> dict[str, Any]:
     return {}
 
 
+def sibling_melody(bv_path: Path) -> list[dict[str, Any]] | None:
+    for name in ("melody.json", "canonical.json"):
+        candidate = bv_path.parent / name
+        if candidate.exists():
+            payload = read_json(candidate)
+            melody = payload.get("melody")
+            if isinstance(melody, list):
+                return melody
+    return None
+
+
+def sibling_control(bv_path: Path) -> list[dict[str, Any]]:
+    for name in ("melody.json", "canonical.json"):
+        candidate = bv_path.parent / name
+        if candidate.exists():
+            payload = read_json(candidate)
+            control = payload.get("control")
+            if isinstance(control, list):
+                return control
+    return []
+
+
 def resolve_header(payload: dict[str, Any], bv_path: Path) -> dict[str, Any]:
     header: dict[str, Any] = {}
     header.update(sibling_header(bv_path))
@@ -73,6 +127,8 @@ def resolve_header(payload: dict[str, Any], bv_path: Path) -> dict[str, Any]:
     raw_header = payload.get("header")
     if isinstance(raw_header, dict):
         header.update(raw_header)
+    elif "header" in payload:
+        raise BvMidiError("header must be an object when provided.")
 
     header.setdefault("startTime", 0)
     header.setdefault("duration", 0)
@@ -95,11 +151,12 @@ def validate_tempo_map(tempo_map: Any) -> None:
     if not isinstance(tempo_map, list) or not tempo_map:
         raise BvMidiError("header.tempoMap must be a non-empty list.")
     previous_time = -1.0
-    for item in tempo_map:
+    for index, item in enumerate(tempo_map):
         if not isinstance(item, dict):
             raise BvMidiError("Each tempoMap item must be an object.")
-        time = float(item.get("time"))
-        bpm = int(item.get("bpm"))
+        label = f"tempoMap[{index}]"
+        time = require_number(item, "time", label)
+        bpm = require_int(item, "bpm", label)
         if time < 0:
             raise BvMidiError("tempoMap time cannot be negative.")
         if time < previous_time:
@@ -113,12 +170,13 @@ def validate_time_signature_map(time_signature_map: Any) -> None:
     if not isinstance(time_signature_map, list) or not time_signature_map:
         raise BvMidiError("header.timeSignatureMap must be a non-empty list.")
     previous_time = -1.0
-    for item in time_signature_map:
+    for index, item in enumerate(time_signature_map):
         if not isinstance(item, dict):
             raise BvMidiError("Each timeSignatureMap item must be an object.")
-        time = float(item.get("time"))
-        numerator = int(item.get("numerator"))
-        denominator = int(item.get("denominator"))
+        label = f"timeSignatureMap[{index}]"
+        time = require_number(item, "time", label)
+        numerator = require_int(item, "numerator", label)
+        denominator = require_int(item, "denominator", label)
         if time < 0:
             raise BvMidiError("timeSignatureMap time cannot be negative.")
         if time < previous_time:
@@ -207,9 +265,10 @@ def validate_notes(
                 if key not in note:
                     raise BvMidiError(f"Track {track_name} note is missing '{key}'.")
 
-            midi = int(note["midi"])
-            start = float(note["time"])
-            duration = float(note["duration"])
+            label = f"Track {track_name} note"
+            midi = require_int(note, "midi", label)
+            start = require_number(note, "time", label)
+            duration = require_number(note, "duration", label)
             end = start + duration
 
             if midi < C0_MIDI or midi > C6_MIDI:
@@ -249,6 +308,106 @@ def validate_notes(
                 previous_end = max(previous_end, end)
                 previous_note = note
     return max_end
+
+
+def note_time(note: dict[str, Any]) -> float:
+    return float(note["time"])
+
+
+def note_duration(note: dict[str, Any]) -> float:
+    return float(note["duration"])
+
+
+def same_timing(left: dict[str, Any], right: dict[str, Any], tolerance: float) -> bool:
+    return (
+        abs(note_time(left) - note_time(right)) <= tolerance
+        and abs(note_duration(left) - note_duration(right)) <= tolerance
+    )
+
+
+def validate_melody_aligned_harmonies(
+    tracks: dict[str, list[dict[str, Any]]],
+    melody: list[dict[str, Any]] | None,
+    tolerance: float,
+    control: list[dict[str, Any]] | None = None,
+) -> None:
+    if melody is None:
+        return
+
+    no_bv_spans = [
+        (float(item["time"]), float(item["time"]) + float(item["duration"]))
+        for item in control or []
+        if isinstance(item, dict) and item.get("section") == "no_bv"
+    ]
+
+    def requires_harmony(note: dict[str, Any]) -> bool:
+        start = float(note["time"])
+        return not any(
+            span_start - tolerance <= start < span_end - tolerance
+            for span_start, span_end in no_bv_spans
+        )
+
+    for index, melody_note in enumerate(melody):
+        if not isinstance(melody_note, dict):
+            raise BvMidiError(f"Source melody note at index {index} must be an object.")
+        label = f"Source melody note at index {index}"
+        for key in ("name", "midi", "time", "duration"):
+            if key not in melody_note:
+                raise BvMidiError(f"{label} is missing '{key}'.")
+        require_int(melody_note, "midi", label)
+        require_number(melody_note, "time", label)
+        require_number(melody_note, "duration", label)
+
+    for track_name in ("LeadDouble",):
+        if len(tracks[track_name]) != len(melody):
+            raise BvMidiError(
+                f"{track_name} must contain exactly one note per melody note. "
+                f"Expected {len(melody)}, found {len(tracks[track_name])}."
+            )
+
+    harmony_melody = [note for note in melody if requires_harmony(note)]
+    for track_name in MELODY_ALIGNED_TRACKS:
+        if len(tracks[track_name]) != len(harmony_melody):
+            raise BvMidiError(
+                f"{track_name} must contain exactly one note per harmony-enabled melody note. "
+                f"Expected {len(harmony_melody)}, found {len(tracks[track_name])}."
+            )
+
+    for index, melody_note in enumerate(melody):
+        lead_note = tracks["LeadDouble"][index]
+        for key in ("name", "midi", "time", "duration"):
+            if lead_note.get(key) != melody_note.get(key):
+                raise BvMidiError(
+                    "LeadDouble must exactly copy melody. "
+                    f"Mismatch at index {index}, field '{key}'."
+                )
+
+    for index, melody_note in enumerate(harmony_melody):
+        melody_midi = int(melody_note["midi"])
+        for track_name in MELODY_ALIGNED_TRACKS:
+            harmony_note = tracks[track_name][index]
+            if not same_timing(harmony_note, melody_note, tolerance):
+                raise BvMidiError(
+                    f"{track_name} must align to melody timing at index {index}. "
+                    f"Melody time={melody_note['time']} duration={melody_note['duration']}; "
+                    f"{track_name} time={harmony_note['time']} duration={harmony_note['duration']}."
+                )
+
+            harmony_midi = int(harmony_note["midi"])
+            if harmony_midi == melody_midi:
+                raise BvMidiError(
+                    f"{track_name} must use a different pitch from melody at index {index}."
+                )
+            if track_name in HIGH_HARMONY_TRACKS and harmony_midi <= melody_midi:
+                raise BvMidiError(
+                    f"{track_name} must be higher than melody at index {index}. "
+                    f"melody={melody_midi}, harmony={harmony_midi}."
+                )
+            if track_name in LOW_HARMONY_TRACKS and harmony_midi >= melody_midi:
+                raise BvMidiError(
+                    f"{track_name} must be lower than melody at index {index}. "
+                    f"melody={melody_midi}, harmony={harmony_midi}."
+                )
 
 
 def vlq(value: int) -> bytes:
@@ -337,7 +496,11 @@ def write_midi(
     ticks_per_beat: int,
     velocity: int,
     max_note_end: float,
+    overwrite: bool = True,
 ) -> None:
+    if path.exists() and not overwrite:
+        raise BvMidiError(f"Output MIDI file already exists: {path}")
+
     header_duration = float(header.get("duration", 0) or 0)
     end_beats = max(header_duration, max_note_end)
     for item in header["tempoMap"]:
@@ -367,16 +530,31 @@ def convert_bv_raw_to_midi(
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     velocity: int = 80,
     tolerance: float = 0.01,
+    overwrite: bool = True,
 ) -> Path:
     payload = read_json(bv_path)
     header = resolve_header(payload, bv_path)
     tracks = load_tracks(payload)
     segments = build_time_signature_segments(header)
     max_note_end = validate_notes(tracks, segments, tolerance)
+    validate_melody_aligned_harmonies(
+        tracks,
+        sibling_melody(bv_path),
+        tolerance,
+        sibling_control(bv_path),
+    )
 
     destination = output_path or (bv_path.parent / "bv.mid")
-    write_midi(destination, header, tracks, ticks_per_beat, velocity, max_note_end)
+    write_midi(destination, header, tracks, ticks_per_beat, velocity, max_note_end, overwrite)
     return destination
+
+
+def confirm_overwrite(path: Path) -> bool:
+    try:
+        answer = input(f"Output MIDI file already exists: {path}\nOverwrite? [y/N]: ")
+    except EOFError:
+        return False
+    return answer.strip().lower() == "y"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -408,15 +586,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     bv_path = Path(args.bv_raw_json).expanduser()
     output_path = Path(args.output).expanduser() if args.output else None
+    destination = output_path or (bv_path.parent / "bv.mid")
 
     if not bv_path.exists():
         print(f"ERROR: bv_raw.json does not exist: {bv_path}", file=sys.stderr)
+        return 2
+    if not bv_path.is_file():
+        print(f"ERROR: bv_raw.json path is not a file: {bv_path}", file=sys.stderr)
         return 2
     if args.ticks_per_beat <= 0:
         print("ERROR: --ticks-per-beat must be positive.", file=sys.stderr)
         return 2
     if not 1 <= args.velocity <= 127:
         print("ERROR: --velocity must be between 1 and 127.", file=sys.stderr)
+        return 2
+    if destination.exists() and not confirm_overwrite(destination):
+        print(f"Canceled: output MIDI file already exists: {destination}", file=sys.stderr)
         return 2
 
     try:
@@ -426,6 +611,7 @@ def main(argv: list[str] | None = None) -> int:
             args.ticks_per_beat,
             args.velocity,
             args.tolerance,
+            overwrite=True,
         )
     except BvMidiError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -437,4 +623,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
