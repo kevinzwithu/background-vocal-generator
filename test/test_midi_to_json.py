@@ -166,16 +166,8 @@ class MidiToJsonTest(unittest.TestCase):
             canonical["chord"],
         )
 
-    def test_rejects_any_track_set_other_than_exactly_melody_and_chord(self) -> None:
+    def test_rejects_missing_or_duplicate_required_tracks(self) -> None:
         cases = [
-            (
-                "extra track",
-                [
-                    ("melody", [(0, TICKS_PER_BEAT, 60)]),
-                    ("chord", [(0, TICKS_PER_BEAT, 48), (0, TICKS_PER_BEAT, 52)]),
-                    ("extra", [(0, TICKS_PER_BEAT, 64)]),
-                ],
-            ),
             (
                 "wrong track name",
                 [
@@ -208,9 +200,180 @@ class MidiToJsonTest(unittest.TestCase):
                     input_path.write_bytes(midi_bytes)
                     with self.assertRaisesRegex(
                         midi_to_json.MidiValidationError,
-                        "exactly two non-empty tracks named 'melody' and 'chord'",
+                        "exactly one non-empty track named 'melody'",
                     ):
                         midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_accepts_control_track_and_ignores_other_non_required_tracks(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT * 4, 60)]),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT * 4, 48),
+                        (0, TICKS_PER_BEAT * 4, 52),
+                    ],
+                ),
+                track_chunk(
+                    "control",
+                    [
+                        (0, TICKS_PER_BEAT, 0),
+                        (TICKS_PER_BEAT * 2, TICKS_PER_BEAT * 3, 2),
+                        (TICKS_PER_BEAT * 3, TICKS_PER_BEAT * 4, 4),
+                    ],
+                ),
+                track_chunk("ignored arrangement", [(0, TICKS_PER_BEAT, 72)]),
+            ]
+        )
+
+        canonical, output_dir, stderr = self.convert(midi_bytes)
+
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            canonical["control"],
+            [
+                {
+                    "section": "verse",
+                    "name": "C-1",
+                    "midi": 0,
+                    "time": 0,
+                    "duration": 2,
+                    "bar": 1,
+                    "beat": 1,
+                    "grid": 0,
+                },
+                {
+                    "section": "chorus",
+                    "name": "D-1",
+                    "midi": 2,
+                    "time": 2,
+                    "duration": 1,
+                    "bar": 1,
+                    "beat": 3,
+                    "grid": 8,
+                },
+                {
+                    "section": "no_bv",
+                    "name": "E-1",
+                    "midi": 4,
+                    "time": 3,
+                    "duration": 1,
+                    "bar": 1,
+                    "beat": 4,
+                    "grid": 12,
+                },
+            ],
+        )
+        self.assertEqual(
+            json.loads((output_dir / "melody.json").read_text(encoding="utf-8"))["control"],
+            canonical["control"],
+        )
+
+    def test_accepts_control_notes_in_zero_octave(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT * 4, 60)]),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT * 4, 48),
+                        (0, TICKS_PER_BEAT * 4, 52),
+                    ],
+                ),
+                track_chunk(
+                    "control",
+                    [
+                        (0, TICKS_PER_BEAT, 12),
+                        (TICKS_PER_BEAT * 2, TICKS_PER_BEAT * 3, 14),
+                        (TICKS_PER_BEAT * 3, TICKS_PER_BEAT * 4, 16),
+                    ],
+                ),
+            ]
+        )
+
+        canonical, _, _ = self.convert(midi_bytes)
+
+        self.assertEqual(
+            canonical["control"],
+            [
+                {
+                    "section": "verse",
+                    "name": "C0",
+                    "midi": 12,
+                    "time": 0,
+                    "duration": 2,
+                    "bar": 1,
+                    "beat": 1,
+                    "grid": 0,
+                },
+                {
+                    "section": "chorus",
+                    "name": "D0",
+                    "midi": 14,
+                    "time": 2,
+                    "duration": 1,
+                    "bar": 1,
+                    "beat": 3,
+                    "grid": 8,
+                },
+                {
+                    "section": "no_bv",
+                    "name": "E0",
+                    "midi": 16,
+                    "time": 3,
+                    "duration": 1,
+                    "bar": 1,
+                    "beat": 4,
+                    "grid": 12,
+                },
+            ],
+        )
+
+    def test_rejects_overlapping_control_note_coverage(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT * 4, 60)]),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT * 4, 48),
+                        (0, TICKS_PER_BEAT * 4, 52),
+                    ],
+                ),
+                track_chunk(
+                    "control",
+                    [
+                        (0, TICKS_PER_BEAT * 3, 0),
+                        (TICKS_PER_BEAT * 2, TICKS_PER_BEAT * 4, 14),
+                    ],
+                ),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "must not overlap"):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_rejects_duplicate_control_tracks(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT, 60)]),
+                track_chunk("chord", [(0, TICKS_PER_BEAT, 48), (0, TICKS_PER_BEAT, 52)]),
+                track_chunk("control", [(0, TICKS_PER_BEAT, 0)]),
+                track_chunk("control", [(TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 2)]),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "more than one"):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
 
     def test_ignores_empty_tracks_including_duplicate_names(self) -> None:
         midi_bytes = midi_file(
