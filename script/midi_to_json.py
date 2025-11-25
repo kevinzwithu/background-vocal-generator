@@ -20,6 +20,12 @@ C0_MIDI = 12
 C6_MIDI = 84
 MAX_BARS = 250
 MAX_SECONDS = 8 * 60
+MAX_MIDI_FILE_BYTES = 5 * 1024 * 1024
+MAX_TRACKS = 64
+MAX_MIDI_EVENTS = 200_000
+MAX_PARSED_NOTES = 50_000
+MAX_TEMPO_EVENTS = 2_000
+MAX_TIME_SIGNATURE_EVENTS = 1_000
 PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 CONTROL_SECTIONS = {
     0: "verse",
@@ -134,6 +140,11 @@ def close_enough_to_grid(value: float, grid_size: float, tolerance: float) -> tu
     return abs(value - nearest) <= tolerance, nearest
 
 
+def reject_if_over_limit(value: int, limit: int, label: str) -> None:
+    if value > limit:
+        raise MidiParseError(f"MIDI {label} exceeds limit of {limit}.")
+
+
 def parse_track(
     data: bytes,
     ticks_per_beat: int,
@@ -153,6 +164,8 @@ def parse_track(
     event_order = event_order_start
 
     while offset < len(data):
+        reject_if_over_limit(event_order + 1, MAX_MIDI_EVENTS, "event count")
+
         delta, offset = read_var_len(data, offset)
         abs_ticks += delta
 
@@ -185,6 +198,7 @@ def parse_track(
                     raise MidiParseError(f"Track {track_index}: invalid tempo event.")
                 bpm = math.floor(60_000_000 / microseconds_per_quarter)
                 tempo_events.append(TempoEvent(abs_ticks, bpm, event_order))
+                reject_if_over_limit(len(tempo_events), MAX_TEMPO_EVENTS, "tempo event count")
             elif meta_type == 0x58 and length >= 2:
                 numerator = payload[0]
                 denominator = 2 ** payload[1]
@@ -192,6 +206,11 @@ def parse_track(
                     raise MidiParseError(f"Track {track_index}: invalid time signature event.")
                 time_signature_events.append(
                     TimeSignatureEvent(abs_ticks, numerator, denominator, event_order)
+                )
+                reject_if_over_limit(
+                    len(time_signature_events),
+                    MAX_TIME_SIGNATURE_EVENTS,
+                    "time signature event count",
                 )
             event_order += 1
             continue
@@ -225,6 +244,7 @@ def parse_track(
                         del active_notes[key]
                     display_name = track_name or f"track_{track_index}"
                     notes.append(RawNote(display_name, note, start_ticks, abs_ticks))
+                    reject_if_over_limit(len(notes), MAX_PARSED_NOTES, "parsed note count")
         event_order += 1
 
     if active_notes:
@@ -239,7 +259,16 @@ def parse_track(
 
 
 def parse_midi(path: Path) -> tuple[int, list[TrackData], list[TempoEvent], list[TimeSignatureEvent]]:
-    data = path.read_bytes()
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        raise MidiParseError(f"Unable to inspect MIDI file: {exc}") from exc
+    reject_if_over_limit(file_size, MAX_MIDI_FILE_BYTES, "file size")
+
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise MidiParseError(f"Unable to read MIDI file: {exc}") from exc
     offset = 0
 
     chunk_type, offset = read_exact(data, offset, 4, "MIDI header chunk type")
@@ -253,6 +282,7 @@ def parse_midi(path: Path) -> tuple[int, list[TrackData], list[TempoEvent], list
 
     midi_format = int.from_bytes(header_payload[0:2], "big")
     track_count = int.from_bytes(header_payload[2:4], "big")
+    reject_if_over_limit(track_count, MAX_TRACKS, "track count")
     division = int.from_bytes(header_payload[4:6], "big")
     if division & 0x8000:
         raise MidiParseError("SMPTE time division is not supported. Use ticks-per-quarter MIDI.")

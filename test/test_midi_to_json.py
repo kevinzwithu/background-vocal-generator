@@ -9,6 +9,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -619,6 +620,80 @@ class MidiToJsonTest(unittest.TestCase):
             input_path.write_bytes(midi_bytes)
             with self.assertRaisesRegex(midi_to_json.MidiValidationError, "8 minutes"):
                 midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_rejects_midi_file_larger_than_parser_limit(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "too-large.mid"
+            input_path.write_bytes(b"0" * 17)
+
+            with (
+                patch.object(midi_to_json, "MAX_MIDI_FILE_BYTES", 16),
+                self.assertRaisesRegex(midi_to_json.MidiParseError, "file size exceeds limit"),
+            ):
+                midi_to_json.parse_midi(input_path)
+
+    def test_rejects_midi_with_too_many_tracks_before_parsing_tracks(self) -> None:
+        midi_bytes = midi_file([track_chunk(None, []) for _ in range(3)])
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "too-many-tracks.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with (
+                patch.object(midi_to_json, "MAX_TRACKS", 2),
+                self.assertRaisesRegex(midi_to_json.MidiParseError, "track count exceeds limit"),
+            ):
+                midi_to_json.parse_midi(input_path)
+
+    def test_rejects_midi_with_too_many_events_during_track_parse(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [
+                        (0, TICKS_PER_BEAT, 60),
+                        (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 62),
+                    ],
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "too-many-events.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with (
+                patch.object(midi_to_json, "MAX_MIDI_EVENTS", 3),
+                self.assertRaisesRegex(midi_to_json.MidiParseError, "event count exceeds limit"),
+            ):
+                midi_to_json.parse_midi(input_path)
+
+    def test_rejects_midi_with_too_many_parsed_notes(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [
+                        (0, TICKS_PER_BEAT, 60),
+                        (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 62),
+                    ],
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "too-many-notes.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with (
+                patch.object(midi_to_json, "MAX_PARSED_NOTES", 1),
+                self.assertRaisesRegex(midi_to_json.MidiParseError, "parsed note count exceeds limit"),
+            ):
+                midi_to_json.parse_midi(input_path)
 
 
 if __name__ == "__main__":
