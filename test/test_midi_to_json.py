@@ -695,6 +695,33 @@ class MidiToJsonTest(unittest.TestCase):
             ):
                 midi_to_json.parse_midi(input_path)
 
+    def test_main_rejects_directory_input_with_stable_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stderr = io.StringIO()
+
+            with redirect_stderr(stderr):
+                result = midi_to_json.main([str(root)])
+
+            self.assertEqual(result, 2)
+            self.assertIn("Input MIDI path is not a file", stderr.getvalue())
+
+    def test_main_catches_os_errors_from_conversion(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(b"MThd")
+            stderr = io.StringIO()
+
+            with (
+                patch.object(midi_to_json, "convert_midi_to_json", side_effect=OSError("disk full")),
+                redirect_stderr(stderr),
+            ):
+                result = midi_to_json.main([str(input_path)])
+
+            self.assertEqual(result, 1)
+            self.assertIn("ERROR: disk full", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

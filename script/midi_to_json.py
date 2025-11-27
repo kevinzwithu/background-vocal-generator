@@ -885,13 +885,20 @@ def main(argv: list[str] | None = None) -> int:
     input_path = Path(args.input_midi).expanduser()
     output_root = Path(args.output_root).expanduser()
 
-    if not input_path.exists():
-        print(f"ERROR: Input MIDI file does not exist: {input_path}", file=sys.stderr)
+    try:
+        if not input_path.exists():
+            print(f"ERROR: Input MIDI file does not exist: {input_path}", file=sys.stderr)
+            return 2
+        if not input_path.is_file():
+            print(f"ERROR: Input MIDI path is not a file: {input_path}", file=sys.stderr)
+            return 2
+    except OSError as exc:
+        print(f"ERROR: Unable to inspect input MIDI file {input_path}: {exc}", file=sys.stderr)
         return 2
 
     try:
         output_dir = convert_midi_to_json(input_path, output_root, args.tolerance)
-    except (MidiParseError, MidiValidationError) as exc:
+    except (MidiParseError, MidiValidationError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
