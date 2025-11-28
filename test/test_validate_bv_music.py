@@ -40,6 +40,20 @@ def header() -> dict[str, Any]:
     }
 
 
+def variable_time_signature_header() -> dict[str, Any]:
+    return {
+        "startTime": 0,
+        "duration": 14,
+        "timeUnit": "beats",
+        "grid": "1/16_bar",
+        "tempoMap": [{"time": 0, "bpm": 120}],
+        "timeSignatureMap": [
+            {"time": 0, "numerator": 3, "denominator": 4},
+            {"time": 6, "numerator": 4, "denominator": 4},
+        ],
+    }
+
+
 def melody() -> list[dict[str, Any]]:
     return [
         {"name": "C4", "midi": 60, "time": 0, "duration": 1},
@@ -116,6 +130,48 @@ class ValidateBvMusicTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertFalse(report["passed"])
         self.assertIn("must contain only", report["hardErrors"][0])
+
+    def test_bar_key_respects_time_signature_changes(self) -> None:
+        segments = validate_bv_music.build_time_signature_segments(
+            variable_time_signature_header()
+        )
+
+        self.assertEqual(validate_bv_music.bar_key(0, segments), 1)
+        self.assertEqual(validate_bv_music.bar_key(3, segments), 2)
+        self.assertEqual(validate_bv_music.bar_key(6, segments), 3)
+        self.assertEqual(validate_bv_music.bar_key(9.5, segments), 3)
+        self.assertEqual(validate_bv_music.bar_key(10, segments), 4)
+
+    def test_chord_events_respects_time_signature_changes(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            note_txt = root / "note.txt"
+            note_txt.write_text(
+                "\n".join(
+                    [
+                        "Time Unit: beats",
+                        "",
+                        "Bar 1: Time Signature 3/4, BPM 120",
+                        "Bar 1: beat 1 C",
+                        "Bar 2: beat 1 G",
+                        "Bar 3: Time Signature 4/4",
+                        "Bar 3: beat 1 D",
+                        "Bar 4: beat 1 F",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            events = validate_bv_music.chord_events(
+                note_txt,
+                variable_time_signature_header(),
+            )
+
+        self.assertEqual(
+            [(time, chord) for time, _, chord in events],
+            [(0, "C"), (3, "G"), (6, "D"), (10, "F")],
+        )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,15 @@ ROOTS = {
     "B": 11,
     "Cb": 11,
 }
+
+
+@dataclass(frozen=True)
+class TimeSignatureSegment:
+    start: float
+    numerator: int
+    denominator: int
+    bar_length: float
+    start_bar: int
 
 
 def midi_name(midi: int) -> str:
@@ -128,16 +138,76 @@ def section_at(control: list[dict[str, Any]], time: float) -> str:
     return "default"
 
 
-def bar_key(time: float, header: dict[str, Any]) -> int:
-    time_sigs = header.get("timeSignatureMap") or [{"time": 0, "numerator": 4, "denominator": 4}]
-    active = time_sigs[0]
-    for item in time_sigs:
-        if float(item["time"]) <= time:
-            active = item
+def build_time_signature_segments(header: dict[str, Any]) -> list[TimeSignatureSegment]:
+    time_sigs = header.get("timeSignatureMap") or [
+        {"time": 0, "numerator": 4, "denominator": 4}
+    ]
+    segments: list[TimeSignatureSegment] = []
+    current_start_bar = 1
+
+    for index, item in enumerate(time_sigs):
+        start = float(item["time"])
+        numerator = int(item["numerator"])
+        denominator = int(item["denominator"])
+        bar_length = numerator * 4 / denominator
+
+        if index > 0:
+            previous = segments[-1]
+            elapsed = max(0.0, start - previous.start)
+            current_start_bar = previous.start_bar + round(elapsed / previous.bar_length)
+
+        segments.append(
+            TimeSignatureSegment(
+                start=start,
+                numerator=numerator,
+                denominator=denominator,
+                bar_length=bar_length,
+                start_bar=current_start_bar,
+            )
+        )
+
+    return segments
+
+
+def segment_for_time(
+    segments: list[TimeSignatureSegment],
+    time: float,
+) -> TimeSignatureSegment:
+    selected = segments[0]
+    for segment in segments:
+        if time + 1e-9 >= segment.start:
+            selected = segment
         else:
             break
-    bar_length = int(active["numerator"]) * 4 / int(active["denominator"])
-    return int(time // bar_length) + 1
+    return selected
+
+
+def segment_for_bar(
+    segments: list[TimeSignatureSegment],
+    bar: int,
+) -> TimeSignatureSegment:
+    selected = segments[0]
+    for segment in segments:
+        if bar >= segment.start_bar:
+            selected = segment
+        else:
+            break
+    return selected
+
+
+def bar_key(time: float, segments: list[TimeSignatureSegment]) -> int:
+    segment = segment_for_time(segments, time)
+    offset = max(0.0, time - segment.start)
+    return segment.start_bar + int(offset // segment.bar_length)
+
+
+def bar_beat_to_time(
+    bar: int,
+    beat: float,
+    segments: list[TimeSignatureSegment],
+) -> float:
+    segment = segment_for_bar(segments, bar)
+    return segment.start + (bar - segment.start_bar) * segment.bar_length + (beat - 1)
 
 
 def chord_pitch_classes(chord_name: str) -> set[int] | None:
@@ -181,13 +251,7 @@ def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, se
     if not note_txt.exists():
         return []
     events: list[tuple[float, set[int] | None, str]] = []
-    bar_lengths: dict[int, float] = {}
-    default_bar_length = 4.0
-    for item in header.get("timeSignatureMap", []):
-        default_bar_length = int(item["numerator"]) * 4 / int(item["denominator"])
-        break
-    for bar in range(1, int(float(header.get("duration", 0)) // default_bar_length) + 3):
-        bar_lengths[bar] = default_bar_length
+    segments = build_time_signature_segments(header)
 
     bar_pattern = re.compile(r"Bar\s+(\d+):")
     event_pattern = re.compile(r"beat\s+([0-9.]+)\s+([^|]+)")
@@ -202,7 +266,7 @@ def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, se
                 continue
             beat = float(match.group(1))
             chord = match.group(2).strip()
-            time = (bar - 1) * bar_lengths.get(bar, default_bar_length) + (beat - 1)
+            time = bar_beat_to_time(bar, beat, segments)
             events.append((time, chord_pitch_classes(chord), chord))
     return sorted(events, key=lambda item: item[0])
 
@@ -229,6 +293,7 @@ def score_arrangement(
     tracks = payload["tracks"]
     melody = source.get("melody") if isinstance(source.get("melody"), list) else []
     control = control_spans(source)
+    segments = build_time_signature_segments(header)
 
     for track_name in CONTOUR_TRACKS:
         by_bar: dict[int, list[int]] = {}
@@ -236,7 +301,7 @@ def score_arrangement(
             section = section_at(control, float(note["time"]))
             if section == "no_bv":
                 continue
-            by_bar.setdefault(bar_key(float(note["time"]), header), []).append(int(note["midi"]))
+            by_bar.setdefault(bar_key(float(note["time"]), segments), []).append(int(note["midi"]))
         repeated_bars = [
             bar
             for bar, midis in by_bar.items()
