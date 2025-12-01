@@ -190,11 +190,23 @@ def validate_time_signature_map(time_signature_map: Any) -> None:
 
 def build_time_signature_segments(header: dict[str, Any]) -> list[TimeSignatureSegment]:
     segments: list[TimeSignatureSegment] = []
-    for item in header["timeSignatureMap"]:
+    for index, item in enumerate(header["timeSignatureMap"]):
         start = float(item["time"])
         numerator = int(item["numerator"])
         denominator = int(item["denominator"])
         bar_length = numerator * 4 / denominator
+
+        if index > 0:
+            previous = segments[-1]
+            elapsed = start - previous.start
+            bars_elapsed = elapsed / previous.bar_length
+            rounded = round(bars_elapsed)
+            if abs(bars_elapsed - rounded) > 1e-6:
+                raise BvMidiError(
+                    "Time signature change is not aligned to the previous bar boundary: "
+                    f"time={normalize_number(start)} beats."
+                )
+
         segments.append(
             TimeSignatureSegment(
                 start=start,
