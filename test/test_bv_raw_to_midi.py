@@ -233,6 +233,24 @@ class BvRawToMidiTest(unittest.TestCase):
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "tempoMap\\[0\\] is missing 'bpm'"):
                 bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
+    def test_rejects_time_signature_change_off_previous_bar_boundary(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            broken_header = header()
+            broken_header["duration"] = 8
+            broken_header["timeSignatureMap"] = [
+                {"time": 0, "numerator": 4, "denominator": 4},
+                {"time": 5, "numerator": 3, "denominator": 4},
+            ]
+            bv_path.write_text(
+                json.dumps({"header": broken_header, "tracks": tracks()}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "previous bar boundary"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
     def test_rejects_invalid_note_field_format(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
