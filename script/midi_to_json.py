@@ -26,6 +26,7 @@ MAX_MIDI_EVENTS = 200_000
 MAX_PARSED_NOTES = 50_000
 MAX_TEMPO_EVENTS = 2_000
 MAX_TIME_SIGNATURE_EVENTS = 1_000
+OUTPUT_JSON_FILENAMES = ("canonical.json", "melody.json", "chord.json")
 PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 CONTROL_SECTIONS = {
     0: "verse",
@@ -786,7 +787,35 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def convert_midi_to_json(input_path: Path, output_root: Path, tolerance: float) -> Path:
+def output_dir_for_midi(input_path: Path, output_root: Path) -> Path:
+    return output_root / input_path.stem
+
+
+def output_json_paths(output_dir: Path) -> list[Path]:
+    return [output_dir / name for name in OUTPUT_JSON_FILENAMES]
+
+
+def existing_output_json_paths(output_dir: Path) -> list[Path]:
+    return [path for path in output_json_paths(output_dir) if path.exists()]
+
+
+def require_no_existing_outputs(output_dir: Path) -> None:
+    existing = existing_output_json_paths(output_dir)
+    if existing:
+        joined = ", ".join(str(path) for path in existing)
+        raise MidiValidationError(f"Output JSON file(s) already exist: {joined}")
+
+
+def convert_midi_to_json(
+    input_path: Path,
+    output_root: Path,
+    tolerance: float,
+    overwrite: bool = True,
+) -> Path:
+    output_dir = output_dir_for_midi(input_path, output_root)
+    if not overwrite:
+        require_no_existing_outputs(output_dir)
+
     ticks_per_beat, tracks, tempo_events, time_signature_events = parse_midi(input_path)
     music_tracks = non_empty_tracks(tracks)
 
@@ -843,8 +872,6 @@ def convert_midi_to_json(input_path: Path, output_root: Path, tolerance: float) 
         canonical["control"] = control_notes
         melody_payload["control"] = control_notes
 
-    work_name = input_path.stem
-    output_dir = output_root / work_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     write_json(output_dir / "canonical.json", canonical)
@@ -859,6 +886,15 @@ def convert_midi_to_json(input_path: Path, output_root: Path, tolerance: float) 
         )
 
     return output_dir
+
+
+def confirm_overwrite(paths: list[Path]) -> bool:
+    joined = "\n".join(str(path) for path in paths)
+    try:
+        answer = input(f"Output JSON file(s) already exist:\n{joined}\nOverwrite? [y/N]: ")
+    except EOFError:
+        return False
+    return answer.strip().lower() == "y"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -894,6 +930,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     except OSError as exc:
         print(f"ERROR: Unable to inspect input MIDI file {input_path}: {exc}", file=sys.stderr)
+        return 2
+
+    output_dir = output_dir_for_midi(input_path, output_root)
+    existing_outputs = existing_output_json_paths(output_dir)
+    if existing_outputs and not confirm_overwrite(existing_outputs):
+        print(f"Canceled: output JSON file(s) already exist in {output_dir}", file=sys.stderr)
         return 2
 
     try:
