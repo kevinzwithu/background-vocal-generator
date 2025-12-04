@@ -5,7 +5,7 @@ import io
 import json
 import sys
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -721,6 +721,68 @@ class MidiToJsonTest(unittest.TestCase):
 
             self.assertEqual(result, 1)
             self.assertIn("ERROR: disk full", stderr.getvalue())
+
+    def test_main_cancels_when_output_json_exists_and_user_does_not_confirm(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT, 60)]),
+                track_chunk("chord", [(0, TICKS_PER_BEAT, 48), (0, TICKS_PER_BEAT, 52)]),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            output_dir = root / "output" / "song"
+            canonical_path = output_dir / "canonical.json"
+            input_path.write_bytes(midi_bytes)
+            output_dir.mkdir(parents=True)
+            canonical_path.write_text("existing", encoding="utf-8")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("builtins.input", return_value="n"),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                result = midi_to_json.main([str(input_path), "--output-root", str(root / "output")])
+
+            self.assertEqual(result, 2)
+            self.assertEqual(canonical_path.read_text(encoding="utf-8"), "existing")
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("Canceled", stderr.getvalue())
+
+    def test_main_overwrites_existing_output_json_after_y_confirmation(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT, 60)]),
+                track_chunk("chord", [(0, TICKS_PER_BEAT, 48), (0, TICKS_PER_BEAT, 52)]),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            output_dir = root / "output" / "song"
+            canonical_path = output_dir / "canonical.json"
+            input_path.write_bytes(midi_bytes)
+            output_dir.mkdir(parents=True)
+            canonical_path.write_text("existing", encoding="utf-8")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch("builtins.input", return_value="y"),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                result = midi_to_json.main([str(input_path), "--output-root", str(root / "output")])
+
+            self.assertEqual(result, 0)
+            self.assertNotEqual(canonical_path.read_text(encoding="utf-8"), "existing")
+            self.assertIn("Wrote JSON files", stdout.getvalue())
+            self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":
