@@ -57,18 +57,41 @@ def require_number(item: dict[str, Any], key: str, label: str) -> float:
     if key not in item:
         raise BvMidiError(f"{label} is missing '{key}'.")
     try:
-        return float(item[key])
+        value = float(item[key])
     except (TypeError, ValueError) as exc:
         raise BvMidiError(f"{label}.{key} must be a number.") from exc
+    if not math.isfinite(value):
+        raise BvMidiError(f"{label}.{key} must be a finite number.")
+    return value
 
 
 def require_int(item: dict[str, Any], key: str, label: str) -> int:
     if key not in item:
         raise BvMidiError(f"{label} is missing '{key}'.")
-    try:
-        return int(item[key])
-    except (TypeError, ValueError) as exc:
-        raise BvMidiError(f"{label}.{key} must be an integer.") from exc
+    value = item[key]
+    if isinstance(value, bool):
+        raise BvMidiError(f"{label}.{key} must be an integer.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        raise BvMidiError(f"{label}.{key} must be an integer.")
+    if isinstance(value, str):
+        stripped = value.strip()
+        signless = stripped[1:] if stripped.startswith(("+", "-")) else stripped
+        if signless.isdigit():
+            return int(stripped)
+    raise BvMidiError(f"{label}.{key} must be an integer.")
+
+
+def require_quarter_bpm(item: dict[str, Any], key: str, label: str) -> float:
+    bpm = require_number(item, key, label)
+    if bpm <= 0:
+        raise BvMidiError("tempoMap bpm must be positive.")
+    if abs(bpm * 4 - round(bpm * 4)) > 1e-9:
+        raise BvMidiError(f"{label}.{key} must use 0.25 BPM increments.")
+    return bpm
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -156,13 +179,11 @@ def validate_tempo_map(tempo_map: Any) -> None:
             raise BvMidiError("Each tempoMap item must be an object.")
         label = f"tempoMap[{index}]"
         time = require_number(item, "time", label)
-        bpm = require_int(item, "bpm", label)
+        require_quarter_bpm(item, "bpm", label)
         if time < 0:
             raise BvMidiError("tempoMap time cannot be negative.")
         if time < previous_time:
             raise BvMidiError("tempoMap must be sorted by time.")
-        if bpm <= 0:
-            raise BvMidiError("tempoMap bpm must be positive.")
         previous_time = time
 
 
@@ -462,7 +483,7 @@ def conductor_track(header: dict[str, Any], ticks_per_beat: int, end_tick: int) 
 
     for item in header["tempoMap"]:
         tick = beats_to_ticks(float(item["time"]), ticks_per_beat)
-        bpm = int(item["bpm"])
+        bpm = float(item["bpm"])
         microseconds_per_quarter = round(60_000_000 / bpm)
         events.append((tick, 1, meta_event(0x51, microseconds_per_quarter.to_bytes(3, "big"))))
 
