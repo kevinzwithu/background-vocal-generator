@@ -233,6 +233,38 @@ class BvRawToMidiTest(unittest.TestCase):
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "tempoMap\\[0\\] is missing 'bpm'"):
                 bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
+    def test_accepts_quarter_bpm_values(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            fractional_header = header()
+            fractional_header["tempoMap"] = [
+                {"time": 0, "bpm": 130.25},
+                {"time": 2, "bpm": 130.75},
+            ]
+            bv_path.write_text(
+                json.dumps({"header": fractional_header, "tracks": tracks()}),
+                encoding="utf-8",
+            )
+
+            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+            self.assertTrue(output_path.exists())
+
+    def test_rejects_bpm_values_finer_than_quarter(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            broken_header = header()
+            broken_header["tempoMap"] = [{"time": 0, "bpm": 130.125}]
+            bv_path.write_text(
+                json.dumps({"header": broken_header, "tracks": tracks()}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "0.25 BPM increments"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
     def test_rejects_time_signature_change_off_previous_bar_boundary(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -249,6 +281,20 @@ class BvRawToMidiTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "previous bar boundary"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_fractional_midi_without_truncating(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            broken_tracks = tracks()
+            broken_tracks["LeadDouble"][0]["midi"] = 60.9
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": broken_tracks}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "midi must be an integer"):
                 bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
     def test_rejects_invalid_note_field_format(self) -> None:
