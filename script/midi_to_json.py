@@ -63,7 +63,7 @@ class TrackData:
 @dataclass(frozen=True)
 class TempoEvent:
     ticks: int
-    bpm: int
+    bpm: int | float
     order: int
 
 
@@ -141,6 +141,17 @@ def close_enough_to_grid(value: float, grid_size: float, tolerance: float) -> tu
     return abs(value - nearest) <= tolerance, nearest
 
 
+def quarter_bpm_from_microseconds(microseconds_per_quarter: int) -> int | float:
+    bpm = 60_000_000 / microseconds_per_quarter
+    quarter_bpm = round(bpm * 4) / 4
+    if abs(bpm - quarter_bpm) > 0.001:
+        raise MidiParseError(
+            "Tempo event BPM must use 0.25 BPM increments. "
+            f"Found approximately {round(bpm, 6)} BPM."
+        )
+    return normalize_number(quarter_bpm)
+
+
 def reject_if_over_limit(value: int, limit: int, label: str) -> None:
     if value > limit:
         raise MidiParseError(f"MIDI {label} exceeds limit of {limit}.")
@@ -197,7 +208,7 @@ def parse_track(
                 microseconds_per_quarter = int.from_bytes(payload, "big")
                 if microseconds_per_quarter <= 0:
                     raise MidiParseError(f"Track {track_index}: invalid tempo event.")
-                bpm = math.floor(60_000_000 / microseconds_per_quarter)
+                bpm = quarter_bpm_from_microseconds(microseconds_per_quarter)
                 tempo_events.append(TempoEvent(abs_ticks, bpm, event_order))
                 reject_if_over_limit(len(tempo_events), MAX_TEMPO_EVENTS, "tempo event count")
             elif meta_type == 0x58 and length >= 2:
@@ -322,7 +333,7 @@ def ticks_to_beats(ticks: int, ticks_per_beat: int) -> float:
 
 
 def normalize_tempo_map(events: list[TempoEvent], ticks_per_beat: int) -> list[dict[str, Any]]:
-    by_time: dict[float, tuple[int, int]] = {}
+    by_time: dict[float, tuple[int | float, int]] = {}
     for event in sorted(events, key=lambda item: (item.ticks, item.order)):
         by_time[ticks_to_beats(event.ticks, ticks_per_beat)] = (event.bpm, event.order)
 
@@ -720,7 +731,7 @@ def duration_seconds(duration: float, tempo_map: list[dict[str, Any]]) -> float:
         segment_end = min(duration, end)
         if segment_end <= start:
             continue
-        seconds += (segment_end - start) * 60 / int(item["bpm"])
+        seconds += (segment_end - start) * 60 / float(item["bpm"])
     return seconds
 
 

@@ -390,7 +390,6 @@ def score_arrangement(
 def validate(path: Path, min_score: int) -> tuple[dict[str, Any], int]:
     bv_path = resolve_bv_path(path)
     payload, hard_errors = hard_validate(bv_path)
-    source = source_payload(bv_path)
     if payload is None:
         report = {
             "passed": False,
@@ -401,7 +400,32 @@ def validate(path: Path, min_score: int) -> tuple[dict[str, Any], int]:
         }
         return report, 1
 
-    score, warnings, suggestions = score_arrangement(bv_path, payload, source)
+    try:
+        source = source_payload(bv_path)
+    except Exception as exc:  # noqa: BLE001 - keep validator output machine-readable.
+        report = {
+            "passed": False,
+            "score": 0,
+            "minScore": min_score,
+            "hardErrors": [*hard_errors, f"Unable to read source melody/canonical JSON: {exc}"],
+            "warnings": [],
+            "suggestions": ["Fix source JSON files before revising musical details."],
+        }
+        return report, 1
+
+    try:
+        score, warnings, suggestions = score_arrangement(bv_path, payload, source)
+    except Exception as exc:  # noqa: BLE001 - report soft-scoring side input failures.
+        report = {
+            "passed": False,
+            "score": 0,
+            "minScore": min_score,
+            "hardErrors": [*hard_errors, f"Unable to score arrangement: {exc}"],
+            "warnings": [],
+            "suggestions": ["Fix sidecar files used by soft scoring, then rerun validation."],
+        }
+        return report, 1
+
     passed = not hard_errors and score >= min_score
     report = {
         "passed": passed,
