@@ -43,7 +43,7 @@ def meta_event(delta: int, meta_type: int, payload: bytes) -> bytes:
     return vlq(delta) + bytes([0xFF, meta_type]) + vlq(len(payload)) + payload
 
 
-def tempo_payload(bpm: int) -> bytes:
+def tempo_payload(bpm: float) -> bytes:
     microseconds_per_quarter = round(60_000_000 / bpm)
     return microseconds_per_quarter.to_bytes(3, "big")
 
@@ -166,6 +166,41 @@ class MidiToJsonTest(unittest.TestCase):
             json.loads((output_dir / "chord.json").read_text(encoding="utf-8"))["chord"],
             canonical["chord"],
         )
+
+    def test_preserves_quarter_bpm_tempo_events(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [(0, TICKS_PER_BEAT, 60)],
+                    [(0, 0x51, tempo_payload(130.25))],
+                ),
+                track_chunk("chord", [(0, TICKS_PER_BEAT, 48), (0, TICKS_PER_BEAT, 52)]),
+            ]
+        )
+
+        canonical, _, _ = self.convert(midi_bytes)
+
+        self.assertEqual(canonical["header"]["tempoMap"], [{"time": 0, "bpm": 130.25}])
+
+    def test_rejects_tempo_events_finer_than_quarter_bpm(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [(0, TICKS_PER_BEAT, 60)],
+                    [(0, 0x51, tempo_payload(130.125))],
+                ),
+                track_chunk("chord", [(0, TICKS_PER_BEAT, 48), (0, TICKS_PER_BEAT, 52)]),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiParseError, "0.25 BPM increments"):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
 
     def test_rejects_missing_or_duplicate_required_tracks(self) -> None:
         cases = [
