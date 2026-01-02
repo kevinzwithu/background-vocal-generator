@@ -101,6 +101,18 @@ class ValidateBvMusicTest(unittest.TestCase):
             json.dumps({"header": header(), "melody": melody()}),
             encoding="utf-8",
         )
+        (root / "note.txt").write_text(
+            "\n".join(
+                [
+                    "Time Unit: beats",
+                    "",
+                    "Bar 1: Time Signature 4/4, BPM 120",
+                    "Bar 1: beat 1 C | beat 2 F",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         bv_path = root / "bv_raw.json"
         bv_path.write_text(
             json.dumps({"header": header(), "tracks": payload_tracks}),
@@ -131,6 +143,25 @@ class ValidateBvMusicTest(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("must contain only", report["hardErrors"][0])
 
+    def test_fails_when_note_txt_is_missing(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "melody.json").write_text(
+                json.dumps({"header": header(), "melody": melody()}),
+                encoding="utf-8",
+            )
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": tracks()}),
+                encoding="utf-8",
+            )
+
+            report, exit_code = validate_bv_music.validate(bv_path, min_score=80)
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report["passed"])
+        self.assertIn("Missing required note.txt", report["hardErrors"][0])
+
     def test_reports_soft_scoring_side_input_errors_without_crashing(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -147,6 +178,18 @@ class ValidateBvMusicTest(unittest.TestCase):
             bv_path = root / "bv_raw.json"
             bv_path.write_text(
                 json.dumps({"header": header(), "tracks": tracks()}),
+                encoding="utf-8",
+            )
+            (root / "note.txt").write_text(
+                "\n".join(
+                    [
+                        "Time Unit: beats",
+                        "",
+                        "Bar 1: Time Signature 4/4, BPM 120",
+                        "Bar 1: beat 1 C | beat 2 F",
+                    ]
+                )
+                + "\n",
                 encoding="utf-8",
             )
 

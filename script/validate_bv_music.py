@@ -249,7 +249,9 @@ def chord_pitch_classes(chord_name: str) -> set[int] | None:
 
 def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, set[int] | None, str]]:
     if not note_txt.exists():
-        return []
+        raise FileNotFoundError(f"Missing required note.txt: {note_txt}")
+    if not note_txt.is_file():
+        raise ValueError(f"note.txt path is not a file: {note_txt}")
     events: list[tuple[float, set[int] | None, str]] = []
     segments = build_time_signature_segments(header)
 
@@ -268,6 +270,8 @@ def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, se
             chord = match.group(2).strip()
             time = bar_beat_to_time(bar, beat, segments)
             events.append((time, chord_pitch_classes(chord), chord))
+    if not events:
+        raise ValueError(f"note.txt does not contain any chord events: {note_txt}")
     return sorted(events, key=lambda item: item[0])
 
 
