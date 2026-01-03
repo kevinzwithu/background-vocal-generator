@@ -621,11 +621,15 @@ def main(argv: list[str] | None = None) -> int:
     output_path = Path(args.output).expanduser() if args.output else None
     destination = output_path or (bv_path.parent / "bv.mid")
 
-    if not bv_path.exists():
-        print(f"ERROR: bv_raw.json does not exist: {bv_path}", file=sys.stderr)
-        return 2
-    if not bv_path.is_file():
-        print(f"ERROR: bv_raw.json path is not a file: {bv_path}", file=sys.stderr)
+    try:
+        if not bv_path.exists():
+            print(f"ERROR: bv_raw.json does not exist: {bv_path}", file=sys.stderr)
+            return 2
+        if not bv_path.is_file():
+            print(f"ERROR: bv_raw.json path is not a file: {bv_path}", file=sys.stderr)
+            return 2
+    except OSError as exc:
+        print(f"ERROR: Unable to inspect bv_raw.json {bv_path}: {exc}", file=sys.stderr)
         return 2
     if args.ticks_per_beat <= 0:
         print("ERROR: --ticks-per-beat must be positive.", file=sys.stderr)
@@ -633,7 +637,12 @@ def main(argv: list[str] | None = None) -> int:
     if not 1 <= args.velocity <= 127:
         print("ERROR: --velocity must be between 1 and 127.", file=sys.stderr)
         return 2
-    if destination.exists() and not confirm_overwrite(destination):
+    try:
+        destination_exists = destination.exists()
+    except OSError as exc:
+        print(f"ERROR: Unable to inspect output MIDI file {destination}: {exc}", file=sys.stderr)
+        return 2
+    if destination_exists and not confirm_overwrite(destination):
         print(f"Canceled: output MIDI file already exists: {destination}", file=sys.stderr)
         return 2
 
@@ -646,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
             args.tolerance,
             overwrite=True,
         )
-    except BvMidiError as exc:
+    except (BvMidiError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

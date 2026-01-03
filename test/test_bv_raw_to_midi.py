@@ -346,6 +346,38 @@ class BvRawToMidiTest(unittest.TestCase):
                 )
             self.assertEqual(output_path.read_bytes(), b"existing")
 
+    def test_main_handles_input_inspect_os_error(self) -> None:
+        stderr = io.StringIO()
+
+        with (
+            patch.object(Path, "exists", side_effect=OSError("stat failed")),
+            redirect_stderr(stderr),
+        ):
+            result = bv_raw_to_midi.main(["broken/bv_raw.json"])
+
+        self.assertEqual(result, 2)
+        self.assertIn("Unable to inspect bv_raw.json", stderr.getvalue())
+        self.assertIn("stat failed", stderr.getvalue())
+
+    def test_main_catches_os_errors_from_conversion(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": tracks()}),
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+
+            with (
+                patch.object(bv_raw_to_midi, "convert_bv_raw_to_midi", side_effect=OSError("disk full")),
+                redirect_stderr(stderr),
+            ):
+                result = bv_raw_to_midi.main([str(bv_path)])
+
+            self.assertEqual(result, 1)
+            self.assertIn("ERROR: disk full", stderr.getvalue())
+
     def test_main_cancels_when_output_exists_and_user_does_not_confirm(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
