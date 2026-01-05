@@ -290,7 +290,7 @@ def validate_notes(
 ) -> float:
     max_end = 0.0
     for track_name, notes in tracks.items():
-        by_pitch: dict[int, list[tuple[float, float, dict[str, Any]]]] = {}
+        track_notes: list[tuple[float, float, int, dict[str, Any]]] = []
         for note in notes:
             if not isinstance(note, dict):
                 raise BvMidiError(f"Track {track_name} contains a non-object note.")
@@ -326,20 +326,19 @@ def validate_notes(
                         f"grid={normalize_number(segment.grid_size)} beats."
                     )
 
-            by_pitch.setdefault(midi, []).append((start, end, note))
+            track_notes.append((start, end, midi, note))
             max_end = max(max_end, end)
 
-        for midi, pitch_notes in by_pitch.items():
-            previous_end = -1.0
-            previous_note: dict[str, Any] | None = None
-            for start, end, note in sorted(pitch_notes, key=lambda item: (item[0], item[1])):
-                if start < previous_end - tolerance:
-                    raise BvMidiError(
-                        f"Track {track_name} has overlapping same-pitch notes for midi={midi}: "
-                        f"{previous_note} overlaps {note}."
-                    )
-                previous_end = max(previous_end, end)
-                previous_note = note
+        previous_end = -1.0
+        previous_note: dict[str, Any] | None = None
+        for start, end, _, note in sorted(track_notes, key=lambda item: (item[0], item[1], item[2])):
+            if start < previous_end - tolerance:
+                raise BvMidiError(
+                    f"Track {track_name} has overlapping notes: "
+                    f"{previous_note} overlaps {note}."
+                )
+            previous_end = max(previous_end, end)
+            previous_note = note
     return max_end
 
 

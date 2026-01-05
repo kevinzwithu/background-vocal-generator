@@ -297,6 +297,25 @@ class BvRawToMidiTest(unittest.TestCase):
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "midi must be an integer"):
                 bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
+    def test_rejects_cross_pitch_overlap_within_one_track(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            broken_tracks = tracks()
+            broken_tracks["VocalPad1"].append(
+                {"name": "E4", "midi": 64, "time": 1, "duration": 1}
+            )
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": broken_tracks}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                bv_raw_to_midi.BvMidiError,
+                "Track VocalPad1 has overlapping notes",
+            ):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
     def test_rejects_invalid_note_field_format(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
