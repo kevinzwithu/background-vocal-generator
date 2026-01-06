@@ -48,6 +48,37 @@ ROOTS = {
     "B": 11,
     "Cb": 11,
 }
+SUPPORTED_CHORD_QUALITIES = {
+    "",
+    "m",
+    "dim",
+    "aug",
+    "sus",
+    "sus2",
+    "sus4",
+    "add2",
+    "add9",
+    "6",
+    "7",
+    "9",
+    "11",
+    "13",
+    "m6",
+    "m7",
+    "m7b5",
+    "m9",
+    "m11",
+    "m13",
+    "maj7",
+    "maj9",
+    "maj11",
+    "maj13",
+    "dim7",
+    "aug7",
+    "7b9",
+    "7sus2",
+    "7sus4",
+}
 
 
 @dataclass(frozen=True)
@@ -216,13 +247,17 @@ def chord_pitch_classes(chord_name: str) -> set[int] | None:
         return None
     match = re.match(r"^([A-G](?:#|b)?)(.*)$", chord)
     if not match:
-        return None
+        raise ValueError(f"Unsupported chord name: {chord_name}")
     root_name, quality = match.groups()
     root = ROOTS.get(root_name)
-    if root is None:
-        return None
+    if root is None or quality not in SUPPORTED_CHORD_QUALITIES:
+        raise ValueError(f"Unsupported chord name: {chord_name}")
 
     q = quality.lower()
+    if q == "m7b5":
+        return {(root + pc) % 12 for pc in {0, 3, 6, 10}}
+    if q == "7b9":
+        return {(root + pc) % 12 for pc in {0, 1, 4, 7, 10}}
     if "dim" in q:
         pcs = {0, 3, 6}
     elif "aug" in q:
@@ -262,13 +297,27 @@ def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, se
         if not bar_match:
             continue
         bar = int(bar_match.group(1))
+        if bar < 1:
+            raise ValueError(f"note.txt bar must be at least 1: {bar}")
+        segment = segment_for_bar(segments, bar)
         for part in line.split("|"):
             match = event_pattern.search(part.strip())
             if not match:
                 continue
             beat = float(match.group(1))
+            if beat < 1 or beat >= 1 + segment.bar_length:
+                raise ValueError(
+                    f"note.txt beat {beat:g} is outside bar {bar} "
+                    f"for time signature {segment.numerator}/{segment.denominator}."
+                )
             chord = match.group(2).strip()
             time = bar_beat_to_time(bar, beat, segments)
+            duration = float(header.get("duration", 0))
+            if time < 0 or time >= duration:
+                raise ValueError(
+                    f"note.txt chord event at bar {bar} beat {beat:g} "
+                    f"is outside header.duration={duration:g}."
+                )
             events.append((time, chord_pitch_classes(chord), chord))
     if not events:
         raise ValueError(f"note.txt does not contain any chord events: {note_txt}")

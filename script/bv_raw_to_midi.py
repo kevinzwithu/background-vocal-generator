@@ -13,6 +13,9 @@ from typing import Any
 
 
 DEFAULT_TICKS_PER_BEAT = 480
+MAX_TICKS_PER_BEAT = 0x7FFF
+MAX_TEMPO_MICROSECONDS = 0xFFFFFF
+MAX_TIME_SIGNATURE_BYTE = 0xFF
 C0_MIDI = 12
 C6_MIDI = 84
 EXPECTED_TRACKS = (
@@ -89,9 +92,33 @@ def require_quarter_bpm(item: dict[str, Any], key: str, label: str) -> float:
     bpm = require_number(item, key, label)
     if bpm <= 0:
         raise BvMidiError("tempoMap bpm must be positive.")
-    if abs(bpm * 4 - round(bpm * 4)) > 1e-9:
+    quarter_units = bpm * 4
+    if not math.isfinite(quarter_units) or abs(quarter_units - round(quarter_units)) > 1e-9:
         raise BvMidiError(f"{label}.{key} must use 0.25 BPM increments.")
+    tempo_microseconds(bpm, label)
     return bpm
+
+
+def tempo_microseconds(bpm: float, label: str) -> int:
+    microseconds = round(60_000_000 / bpm)
+    if not 1 <= microseconds <= MAX_TEMPO_MICROSECONDS:
+        raise BvMidiError(f"{label}.bpm cannot be represented by a MIDI tempo event.")
+    return microseconds
+
+
+def validate_export_options(ticks_per_beat: int, velocity: int, tolerance: float) -> None:
+    if isinstance(ticks_per_beat, bool) or not isinstance(ticks_per_beat, int):
+        raise BvMidiError("ticks_per_beat must be an integer.")
+    if not 1 <= ticks_per_beat <= MAX_TICKS_PER_BEAT:
+        raise BvMidiError(f"ticks_per_beat must be between 1 and {MAX_TICKS_PER_BEAT}.")
+    if isinstance(velocity, bool) or not isinstance(velocity, int):
+        raise BvMidiError("velocity must be an integer.")
+    if not 1 <= velocity <= 127:
+        raise BvMidiError("velocity must be between 1 and 127.")
+    if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool):
+        raise BvMidiError("tolerance must be a finite non-negative number.")
+    if not math.isfinite(float(tolerance)) or tolerance < 0:
+        raise BvMidiError("tolerance must be a finite non-negative number.")
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -165,6 +192,13 @@ def resolve_header(payload: dict[str, Any], bv_path: Path) -> dict[str, Any]:
     if header["grid"] != "1/16_bar":
         raise BvMidiError("header.grid must be '1/16_bar'.")
 
+    start_time = require_number(header, "startTime", "header")
+    duration = require_number(header, "duration", "header")
+    if abs(start_time) > 1e-9:
+        raise BvMidiError("header.startTime must be 0.")
+    if duration < 0:
+        raise BvMidiError("header.duration cannot be negative.")
+
     validate_tempo_map(header["tempoMap"])
     validate_time_signature_map(header["timeSignatureMap"])
     return header
@@ -185,6 +219,8 @@ def validate_tempo_map(tempo_map: Any) -> None:
         if time < previous_time:
             raise BvMidiError("tempoMap must be sorted by time.")
         previous_time = time
+    if abs(require_number(tempo_map[0], "time", "tempoMap[0]")) > 1e-9:
+        raise BvMidiError("tempoMap must start at time 0.")
 
 
 def validate_time_signature_map(time_signature_map: Any) -> None:
@@ -204,9 +240,19 @@ def validate_time_signature_map(time_signature_map: Any) -> None:
             raise BvMidiError("timeSignatureMap must be sorted by time.")
         if numerator <= 0:
             raise BvMidiError("timeSignatureMap numerator must be positive.")
+        if numerator > MAX_TIME_SIGNATURE_BYTE:
+            raise BvMidiError(
+                f"timeSignatureMap numerator must be at most {MAX_TIME_SIGNATURE_BYTE}."
+            )
         if denominator <= 0 or denominator & (denominator - 1):
             raise BvMidiError("timeSignatureMap denominator must be a power of two.")
+        if denominator.bit_length() - 1 > MAX_TIME_SIGNATURE_BYTE:
+            raise BvMidiError(
+                f"timeSignatureMap denominator exponent must be at most {MAX_TIME_SIGNATURE_BYTE}."
+            )
         previous_time = time
+    if abs(require_number(time_signature_map[0], "time", "timeSignatureMap[0]")) > 1e-9:
+        raise BvMidiError("timeSignatureMap must start at time 0.")
 
 
 def build_time_signature_segments(header: dict[str, Any]) -> list[TimeSignatureSegment]:
@@ -483,14 +529,14 @@ def conductor_track(header: dict[str, Any], ticks_per_beat: int, end_tick: int) 
     for item in header["tempoMap"]:
         tick = beats_to_ticks(float(item["time"]), ticks_per_beat)
         bpm = float(item["bpm"])
-        microseconds_per_quarter = round(60_000_000 / bpm)
+        microseconds_per_quarter = tempo_microseconds(bpm, "tempoMap item")
         events.append((tick, 1, meta_event(0x51, microseconds_per_quarter.to_bytes(3, "big"))))
 
     for item in header["timeSignatureMap"]:
         tick = beats_to_ticks(float(item["time"]), ticks_per_beat)
         numerator = int(item["numerator"])
         denominator = int(item["denominator"])
-        denominator_power = int(math.log2(denominator))
+        denominator_power = denominator.bit_length() - 1
         events.append(
             (
                 tick,
@@ -564,6 +610,7 @@ def convert_bv_raw_to_midi(
     tolerance: float = 0.01,
     overwrite: bool = True,
 ) -> Path:
+    validate_export_options(ticks_per_beat, velocity, tolerance)
     payload = read_json(bv_path)
     header = resolve_header(payload, bv_path)
     tracks = load_tracks(payload)
@@ -630,11 +677,10 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"ERROR: Unable to inspect bv_raw.json {bv_path}: {exc}", file=sys.stderr)
         return 2
-    if args.ticks_per_beat <= 0:
-        print("ERROR: --ticks-per-beat must be positive.", file=sys.stderr)
-        return 2
-    if not 1 <= args.velocity <= 127:
-        print("ERROR: --velocity must be between 1 and 127.", file=sys.stderr)
+    try:
+        validate_export_options(args.ticks_per_beat, args.velocity, args.tolerance)
+    except BvMidiError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     try:
         destination_exists = destination.exists()
