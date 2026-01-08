@@ -265,6 +265,89 @@ class BvRawToMidiTest(unittest.TestCase):
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "0.25 BPM increments"):
                 bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
+    def test_rejects_bpm_that_cannot_be_encoded_as_midi_tempo(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            broken_header = header()
+            broken_header["tempoMap"] = [{"time": 0, "bpm": 0.25}]
+            bv_path.write_text(
+                json.dumps({"header": broken_header, "tracks": tracks()}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "cannot be represented"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_header_maps_that_do_not_start_at_zero(self) -> None:
+        cases = [
+            ("tempoMap", [{"time": 1, "bpm": 120}]),
+            ("timeSignatureMap", [{"time": 1, "numerator": 4, "denominator": 4}]),
+        ]
+
+        for field, value in cases:
+            with self.subTest(field=field), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                bv_path = root / "bv_raw.json"
+                broken_header = header()
+                broken_header[field] = value
+                bv_path.write_text(
+                    json.dumps({"header": broken_header, "tracks": tracks()}),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "must start at time 0"):
+                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_invalid_header_start_and_duration(self) -> None:
+        cases = [
+            ("startTime", 1, "header.startTime must be 0"),
+            ("duration", -1, "header.duration cannot be negative"),
+            ("duration", "bad", "header.duration must be a number"),
+        ]
+
+        for field, value, message in cases:
+            with self.subTest(field=field, value=value), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                bv_path = root / "bv_raw.json"
+                broken_header = header()
+                broken_header[field] = value
+                bv_path.write_text(
+                    json.dumps({"header": broken_header, "tracks": tracks()}),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, message):
+                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_time_signature_values_that_do_not_fit_midi_bytes(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            broken_header = header()
+            broken_header["timeSignatureMap"] = [
+                {"time": 0, "numerator": 256, "denominator": 4}
+            ]
+            bv_path.write_text(
+                json.dumps({"header": broken_header, "tracks": tracks()}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "numerator must be at most 255"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_ticks_per_beat_that_sets_smpte_division_bit(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": tracks()}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "between 1 and 32767"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path, ticks_per_beat=65536)
+
     def test_rejects_time_signature_change_off_previous_bar_boundary(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

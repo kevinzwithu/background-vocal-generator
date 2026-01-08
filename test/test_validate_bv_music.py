@@ -241,6 +241,50 @@ class ValidateBvMusicTest(unittest.TestCase):
             [(0, "C"), (3, "G"), (6, "D"), (10, "F")],
         )
 
+    def test_chord_events_rejects_invalid_bar_and_beat_positions(self) -> None:
+        cases = [
+            ("Bar 0: beat 0 C", "bar must be at least 1"),
+            ("Bar 1: beat 9 C", "beat 9 is outside bar 1"),
+        ]
+
+        for content, message in cases:
+            with self.subTest(content=content), TemporaryDirectory() as temp_dir:
+                note_txt = Path(temp_dir) / "note.txt"
+                note_txt.write_text(content + "\n", encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_bv_music.chord_events(note_txt, header())
+
+    def test_chord_events_rejects_unknown_chord_names(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            note_txt = Path(temp_dir) / "note.txt"
+            note_txt.write_text("Bar 1: beat 1 TotallyWrong\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Unsupported chord name: TotallyWrong"):
+                validate_bv_music.chord_events(note_txt, header())
+
+    def test_chord_pitch_classes_supports_common_altered_chords(self) -> None:
+        self.assertEqual(
+            validate_bv_music.chord_pitch_classes("Bm7b5"),
+            {11, 2, 5, 9},
+        )
+        self.assertEqual(
+            validate_bv_music.chord_pitch_classes("G7b9"),
+            {7, 8, 11, 2, 5},
+        )
+
+    def test_validate_reports_invalid_note_txt_without_crashing(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = self.write_project(root, tracks())
+            (root / "note.txt").write_text("Bar 1: beat 1 TotallyWrong\n", encoding="utf-8")
+
+            report, exit_code = validate_bv_music.validate(bv_path, min_score=80)
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(report["passed"])
+        self.assertIn("Unsupported chord name", report["hardErrors"][0])
+
 
 if __name__ == "__main__":
     unittest.main()
