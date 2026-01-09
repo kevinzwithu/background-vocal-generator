@@ -301,13 +301,18 @@ def parse_midi(path: Path) -> tuple[int, list[TrackData], list[TempoEvent], list
     ticks_per_beat = division
     if ticks_per_beat <= 0:
         raise MidiParseError("Invalid ticks-per-quarter division.")
-    if midi_format not in (0, 1, 2):
+    if midi_format not in (0, 1):
         raise MidiParseError(f"Unsupported MIDI format: {midi_format}.")
+    if track_count <= 0:
+        raise MidiParseError("MIDI must declare at least one track.")
+    if midi_format == 0 and track_count != 1:
+        raise MidiParseError("MIDI format 0 must declare exactly one track.")
 
     tracks: list[TrackData] = []
     tempo_events: list[TempoEvent] = []
     time_signature_events: list[TimeSignatureEvent] = []
     event_order = 0
+    parsed_note_count = 0
 
     for track_index in range(track_count):
         chunk_type, offset = read_exact(data, offset, 4, f"track {track_index} chunk type")
@@ -322,8 +327,21 @@ def parse_midi(path: Path) -> tuple[int, list[TrackData], list[TempoEvent], list
             event_order,
         )
         tracks.append(track)
+        parsed_note_count += len(track.notes)
         tempo_events.extend(track_tempos)
         time_signature_events.extend(track_sigs)
+        reject_if_over_limit(parsed_note_count, MAX_PARSED_NOTES, "parsed note count")
+        reject_if_over_limit(len(tempo_events), MAX_TEMPO_EVENTS, "tempo event count")
+        reject_if_over_limit(
+            len(time_signature_events),
+            MAX_TIME_SIGNATURE_EVENTS,
+            "time signature event count",
+        )
+
+    if offset != len(data):
+        raise MidiParseError(
+            f"MIDI contains {len(data) - offset} trailing byte(s) after declared tracks."
+        )
 
     return ticks_per_beat, tracks, tempo_events, time_signature_events
 

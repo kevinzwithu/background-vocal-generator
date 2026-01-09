@@ -76,9 +76,9 @@ def track_chunk(
     return b"MTrk" + len(payload).to_bytes(4, "big") + bytes(payload)
 
 
-def midi_file(tracks: list[bytes]) -> bytes:
+def midi_file(tracks: list[bytes], midi_format: int = 1) -> bytes:
     header_payload = (
-        (1).to_bytes(2, "big")
+        midi_format.to_bytes(2, "big")
         + len(tracks).to_bytes(2, "big")
         + TICKS_PER_BEAT.to_bytes(2, "big")
     )
@@ -682,6 +682,52 @@ class MidiToJsonTest(unittest.TestCase):
             ):
                 midi_to_json.parse_midi(input_path)
 
+    def test_rejects_format_zero_with_multiple_tracks(self) -> None:
+        midi_bytes = midi_file(
+            [track_chunk("melody", []), track_chunk("chord", [])],
+            midi_format=0,
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "format-zero.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with self.assertRaisesRegex(
+                midi_to_json.MidiParseError,
+                "format 0 must declare exactly one track",
+            ):
+                midi_to_json.parse_midi(input_path)
+
+    def test_rejects_midi_without_declared_tracks(self) -> None:
+        midi_bytes = midi_file([])
+
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "no-tracks.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with self.assertRaisesRegex(midi_to_json.MidiParseError, "at least one track"):
+                midi_to_json.parse_midi(input_path)
+
+    def test_rejects_format_two(self) -> None:
+        midi_bytes = midi_file([track_chunk("sequence", [])], midi_format=2)
+
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "format-two.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with self.assertRaisesRegex(midi_to_json.MidiParseError, "Unsupported MIDI format: 2"):
+                midi_to_json.parse_midi(input_path)
+
+    def test_rejects_trailing_bytes_after_declared_tracks(self) -> None:
+        midi_bytes = midi_file([track_chunk("melody", [])]) + b"garbage"
+
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "trailing.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with self.assertRaisesRegex(midi_to_json.MidiParseError, "7 trailing byte"):
+                midi_to_json.parse_midi(input_path)
+
     def test_rejects_midi_with_too_many_events_during_track_parse(self) -> None:
         midi_bytes = midi_file(
             [
@@ -727,6 +773,63 @@ class MidiToJsonTest(unittest.TestCase):
             with (
                 patch.object(midi_to_json, "MAX_PARSED_NOTES", 1),
                 self.assertRaisesRegex(midi_to_json.MidiParseError, "parsed note count exceeds limit"),
+            ):
+                midi_to_json.parse_midi(input_path)
+
+    def test_rejects_global_parsed_note_limit_across_tracks(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("one", [(0, TICKS_PER_BEAT, 60)]),
+                track_chunk("two", [(0, TICKS_PER_BEAT, 62)]),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "too-many-global-notes.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with (
+                patch.object(midi_to_json, "MAX_PARSED_NOTES", 1),
+                self.assertRaisesRegex(midi_to_json.MidiParseError, "parsed note count exceeds limit"),
+            ):
+                midi_to_json.parse_midi(input_path)
+
+    def test_rejects_global_tempo_event_limit_across_tracks(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("one", [], [(0, 0x51, tempo_payload(120))]),
+                track_chunk("two", [], [(0, 0x51, tempo_payload(120))]),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "too-many-global-tempos.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with (
+                patch.object(midi_to_json, "MAX_TEMPO_EVENTS", 1),
+                self.assertRaisesRegex(midi_to_json.MidiParseError, "tempo event count exceeds limit"),
+            ):
+                midi_to_json.parse_midi(input_path)
+
+    def test_rejects_global_time_signature_event_limit_across_tracks(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("one", [], [(0, 0x58, time_signature_payload(4, 2))]),
+                track_chunk("two", [], [(0, 0x58, time_signature_payload(4, 2))]),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "too-many-global-time-signatures.mid"
+            input_path.write_bytes(midi_bytes)
+
+            with (
+                patch.object(midi_to_json, "MAX_TIME_SIGNATURE_EVENTS", 1),
+                self.assertRaisesRegex(
+                    midi_to_json.MidiParseError,
+                    "time signature event count exceeds limit",
+                ),
             ):
                 midi_to_json.parse_midi(input_path)
 
