@@ -48,36 +48,36 @@ ROOTS = {
     "B": 11,
     "Cb": 11,
 }
-SUPPORTED_CHORD_QUALITIES = {
-    "",
-    "m",
-    "dim",
-    "aug",
-    "sus",
-    "sus2",
-    "sus4",
-    "add2",
-    "add9",
-    "6",
-    "7",
-    "9",
-    "11",
-    "13",
-    "m6",
-    "m7",
-    "m7b5",
-    "m9",
-    "m11",
-    "m13",
-    "maj7",
-    "maj9",
-    "maj11",
-    "maj13",
-    "dim7",
-    "aug7",
-    "7b9",
-    "7sus2",
-    "7sus4",
+CHORD_QUALITY_INTERVALS = {
+    "": {0, 4, 7},
+    "m": {0, 3, 7},
+    "dim": {0, 3, 6},
+    "aug": {0, 4, 8},
+    "sus": {0, 5, 7},
+    "sus2": {0, 2, 7},
+    "sus4": {0, 5, 7},
+    "add2": {0, 2, 4, 7},
+    "add9": {0, 2, 4, 7},
+    "6": {0, 4, 7, 9},
+    "7": {0, 4, 7, 10},
+    "9": {0, 2, 4, 7, 10},
+    "11": {0, 2, 4, 5, 7, 10},
+    "13": {0, 2, 4, 5, 7, 9, 10},
+    "m6": {0, 3, 7, 9},
+    "m7": {0, 3, 7, 10},
+    "m7b5": {0, 3, 6, 10},
+    "m9": {0, 2, 3, 7, 10},
+    "m11": {0, 2, 3, 5, 7, 10},
+    "m13": {0, 2, 3, 5, 7, 9, 10},
+    "maj7": {0, 4, 7, 11},
+    "maj9": {0, 2, 4, 7, 11},
+    "maj11": {0, 2, 4, 5, 7, 11},
+    "maj13": {0, 2, 4, 5, 7, 9, 11},
+    "dim7": {0, 3, 6, 9},
+    "aug7": {0, 4, 8, 10},
+    "7b9": {0, 1, 4, 7, 10},
+    "7sus2": {0, 2, 7, 10},
+    "7sus4": {0, 5, 7, 10},
 }
 
 
@@ -112,8 +112,15 @@ def source_payload(bv_path: Path) -> dict[str, Any]:
     for name in ("melody.json", "canonical.json"):
         candidate = bv_path.parent / name
         if candidate.exists():
-            return read_json(candidate)
-    return {}
+            payload = read_json(candidate)
+            if not isinstance(payload, dict):
+                raise ValueError(f"Source JSON root must be an object: {candidate}")
+            if not isinstance(payload.get("melody"), list):
+                raise ValueError(f"Source JSON must contain a melody list: {candidate}")
+            return payload
+    raise FileNotFoundError(
+        f"Missing required source melody.json or canonical.json beside {bv_path}"
+    )
 
 
 def hard_validate(bv_path: Path) -> tuple[dict[str, Any] | None, list[str]]:
@@ -250,36 +257,40 @@ def chord_pitch_classes(chord_name: str) -> set[int] | None:
         raise ValueError(f"Unsupported chord name: {chord_name}")
     root_name, quality = match.groups()
     root = ROOTS.get(root_name)
-    if root is None or quality not in SUPPORTED_CHORD_QUALITIES:
+    intervals = CHORD_QUALITY_INTERVALS.get(quality)
+    if root is None or intervals is None:
         raise ValueError(f"Unsupported chord name: {chord_name}")
+    return {(root + pc) % 12 for pc in intervals}
 
-    q = quality.lower()
-    if q == "m7b5":
-        return {(root + pc) % 12 for pc in {0, 3, 6, 10}}
-    if q == "7b9":
-        return {(root + pc) % 12 for pc in {0, 1, 4, 7, 10}}
-    if "dim" in q:
-        pcs = {0, 3, 6}
-    elif "aug" in q:
-        pcs = {0, 4, 8}
-    elif "sus2" in q:
-        pcs = {0, 2, 7}
-    elif "sus" in q:
-        pcs = {0, 5, 7}
-    elif q.startswith("m") and not q.startswith("maj"):
-        pcs = {0, 3, 7}
-    else:
-        pcs = {0, 4, 7}
 
-    if "maj7" in q:
-        pcs.add(11)
-    elif "7" in q:
-        pcs.add(10)
-    if "6" in q:
-        pcs.add(9)
-    if "9" in q or "add2" in q:
-        pcs.add(2)
-    return {(root + pc) % 12 for pc in pcs}
+def expected_bar_count(header: dict[str, Any], segments: list[TimeSignatureSegment]) -> int:
+    duration = float(header["duration"])
+    if duration <= 0:
+        return 0
+    return bar_key(max(0.0, duration - 1e-9), segments)
+
+
+def expected_tempo_markers(
+    header: dict[str, Any],
+    segments: list[TimeSignatureSegment],
+) -> dict[int, float]:
+    markers: dict[int, float] = {}
+    for item in header["tempoMap"]:
+        bar = bar_key(float(item["time"]), segments)
+        bpm = float(item["bpm"])
+        if bar in markers and markers[bar] != bpm:
+            raise ValueError(f"Multiple BPM changes in bar {bar} cannot be represented in note.txt.")
+        markers[bar] = bpm
+    return markers
+
+
+def validate_markers(
+    actual: dict[int, int | float | tuple[int, int]],
+    expected: dict[int, int | float | tuple[int, int]],
+    label: str,
+) -> None:
+    if actual != expected:
+        raise ValueError(f"note.txt {label} markers do not match header: expected={expected}, found={actual}")
 
 
 def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, set[int] | None, str]]:
@@ -290,20 +301,48 @@ def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, se
     events: list[tuple[float, set[int] | None, str]] = []
     segments = build_time_signature_segments(header)
 
-    bar_pattern = re.compile(r"Bar\s+(\d+):")
+    lines = note_txt.read_text(encoding="utf-8").splitlines()
+    non_empty = [line.strip() for line in lines if line.strip()]
+    if not non_empty or non_empty[0] != "Time Unit: beats":
+        raise ValueError("note.txt first non-empty line must be 'Time Unit: beats'.")
+
+    bar_pattern = re.compile(r"^Bar\s+(\d+):")
     event_pattern = re.compile(r"beat\s+([0-9.]+)\s+([^|]+)")
-    for line in note_txt.read_text(encoding="utf-8").splitlines():
-        bar_match = bar_pattern.search(line)
+    time_signature_pattern = re.compile(r"Time Signature\s+(\d+)/(\d+)")
+    bpm_pattern = re.compile(r"BPM\s+([0-9]+(?:\.[0-9]+)?)")
+    chord_bars: list[int] = []
+    time_signature_markers: dict[int, tuple[int, int]] = {}
+    tempo_markers: dict[int, float] = {}
+
+    for line in lines:
+        stripped = line.strip()
+        bar_match = bar_pattern.search(stripped)
         if not bar_match:
             continue
         bar = int(bar_match.group(1))
         if bar < 1:
             raise ValueError(f"note.txt bar must be at least 1: {bar}")
         segment = segment_for_bar(segments, bar)
-        for part in line.split("|"):
+        time_signature_match = time_signature_pattern.search(stripped)
+        if time_signature_match:
+            if bar in time_signature_markers:
+                raise ValueError(f"note.txt contains duplicate time signature marker for bar {bar}.")
+            time_signature_markers[bar] = (
+                int(time_signature_match.group(1)),
+                int(time_signature_match.group(2)),
+            )
+        bpm_match = bpm_pattern.search(stripped)
+        if bpm_match:
+            if bar in tempo_markers:
+                raise ValueError(f"note.txt contains duplicate BPM marker for bar {bar}.")
+            tempo_markers[bar] = float(bpm_match.group(1))
+
+        line_events = 0
+        for part in stripped.split("|"):
             match = event_pattern.search(part.strip())
             if not match:
                 continue
+            line_events += 1
             beat = float(match.group(1))
             if beat < 1 or beat >= 1 + segment.bar_length:
                 raise ValueError(
@@ -319,8 +358,25 @@ def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, se
                     f"is outside header.duration={duration:g}."
                 )
             events.append((time, chord_pitch_classes(chord), chord))
+        if line_events:
+            chord_bars.append(bar)
+
     if not events:
         raise ValueError(f"note.txt does not contain any chord events: {note_txt}")
+
+    bar_count = expected_bar_count(header, segments)
+    expected_bars = list(range(1, bar_count + 1))
+    if chord_bars != expected_bars:
+        raise ValueError(
+            f"note.txt chord bars must be complete and ordered: "
+            f"expected bars 1-{bar_count}, found={chord_bars[:16]}"
+        )
+
+    expected_time_signatures = {
+        segment.start_bar: (segment.numerator, segment.denominator) for segment in segments
+    }
+    validate_markers(time_signature_markers, expected_time_signatures, "time signature")
+    validate_markers(tempo_markers, expected_tempo_markers(header, segments), "BPM")
     return sorted(events, key=lambda item: item[0])
 
 
