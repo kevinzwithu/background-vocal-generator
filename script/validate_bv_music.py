@@ -105,7 +105,7 @@ def resolve_bv_path(path: Path) -> Path:
 
 
 def read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return bv_raw_to_midi.read_json(path)
 
 
 def source_payload(bv_path: Path) -> dict[str, Any]:
@@ -117,6 +117,18 @@ def source_payload(bv_path: Path) -> dict[str, Any]:
                 raise ValueError(f"Source JSON root must be an object: {candidate}")
             if not isinstance(payload.get("melody"), list):
                 raise ValueError(f"Source JSON must contain a melody list: {candidate}")
+            bv_raw_to_midi.reject_if_over_limit(
+                len(payload["melody"]),
+                bv_raw_to_midi.MAX_SOURCE_MELODY_NOTES,
+                "Source melody note count",
+            )
+            control = payload.get("control")
+            if isinstance(control, list):
+                bv_raw_to_midi.reject_if_over_limit(
+                    len(control),
+                    bv_raw_to_midi.MAX_CONTROL_EVENTS,
+                    "Control event count",
+                )
             return payload
     raise FileNotFoundError(
         f"Missing required source melody.json or canonical.json beside {bv_path}"

@@ -13,6 +13,14 @@ from typing import Any
 
 
 DEFAULT_TICKS_PER_BEAT = 480
+MAX_JSON_FILE_BYTES = 5 * 1024 * 1024
+MAX_NOTES_PER_TRACK = 50_000
+MAX_TOTAL_NOTES = 200_000
+MAX_SOURCE_MELODY_NOTES = 50_000
+MAX_CONTROL_EVENTS = 50_000
+MAX_TEMPO_EVENTS = 2_000
+MAX_TIME_SIGNATURE_EVENTS = 1_000
+MAX_MIDI_VLQ = 0x0FFFFFFF
 MAX_TICKS_PER_BEAT = 0x7FFF
 MAX_TEMPO_MICROSECONDS = 0xFFFFFF
 MAX_TIME_SIGNATURE_BYTE = 0xFF
@@ -61,7 +69,7 @@ def require_number(item: dict[str, Any], key: str, label: str) -> float:
         raise BvMidiError(f"{label} is missing '{key}'.")
     try:
         value = float(item[key])
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise BvMidiError(f"{label}.{key} must be a number.") from exc
     if not math.isfinite(value):
         raise BvMidiError(f"{label}.{key} must be a finite number.")
@@ -84,7 +92,10 @@ def require_int(item: dict[str, Any], key: str, label: str) -> int:
         stripped = value.strip()
         signless = stripped[1:] if stripped.startswith(("+", "-")) else stripped
         if signless.isdigit():
-            return int(stripped)
+            try:
+                return int(stripped)
+            except ValueError as exc:
+                raise BvMidiError(f"{label}.{key} must be an integer.") from exc
     raise BvMidiError(f"{label}.{key} must be an integer.")
 
 
@@ -121,16 +132,28 @@ def validate_export_options(ticks_per_beat: int, velocity: int, tolerance: float
         raise BvMidiError("tolerance must be a finite non-negative number.")
 
 
+def reject_if_over_limit(value: int, limit: int, label: str) -> None:
+    if value > limit:
+        raise BvMidiError(f"{label} exceeds limit of {limit}.")
+
+
 def read_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        raise BvMidiError(f"Input JSON file does not exist: {path}")
-    if not path.is_file():
-        raise BvMidiError(f"Input JSON path is not a file: {path}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not path.exists():
+            raise BvMidiError(f"Input JSON file does not exist: {path}")
+        if not path.is_file():
+            raise BvMidiError(f"Input JSON path is not a file: {path}")
+        reject_if_over_limit(path.stat().st_size, MAX_JSON_FILE_BYTES, "JSON file size")
+        with path.open("rb") as source:
+            raw = source.read(MAX_JSON_FILE_BYTES + 1)
+        reject_if_over_limit(len(raw), MAX_JSON_FILE_BYTES, "JSON file size")
     except OSError as exc:
-        raise BvMidiError(f"Unable to read JSON file {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
+        raise BvMidiError(f"Unable to inspect or read JSON file {path}: {exc}") from exc
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise BvMidiError(f"JSON file must use UTF-8 encoding: {path}") from exc
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise BvMidiError(f"Invalid JSON file {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise BvMidiError(f"JSON root must be an object: {path}")
@@ -155,6 +178,11 @@ def sibling_melody(bv_path: Path) -> list[dict[str, Any]] | None:
             payload = read_json(candidate)
             melody = payload.get("melody")
             if isinstance(melody, list):
+                reject_if_over_limit(
+                    len(melody),
+                    MAX_SOURCE_MELODY_NOTES,
+                    "Source melody note count",
+                )
                 return melody
     return None
 
@@ -166,6 +194,7 @@ def sibling_control(bv_path: Path) -> list[dict[str, Any]]:
             payload = read_json(candidate)
             control = payload.get("control")
             if isinstance(control, list):
+                reject_if_over_limit(len(control), MAX_CONTROL_EVENTS, "Control event count")
                 return control
     return []
 
@@ -207,6 +236,7 @@ def resolve_header(payload: dict[str, Any], bv_path: Path) -> dict[str, Any]:
 def validate_tempo_map(tempo_map: Any) -> None:
     if not isinstance(tempo_map, list) or not tempo_map:
         raise BvMidiError("header.tempoMap must be a non-empty list.")
+    reject_if_over_limit(len(tempo_map), MAX_TEMPO_EVENTS, "Tempo event count")
     previous_time = -1.0
     for index, item in enumerate(tempo_map):
         if not isinstance(item, dict):
@@ -226,6 +256,11 @@ def validate_tempo_map(tempo_map: Any) -> None:
 def validate_time_signature_map(time_signature_map: Any) -> None:
     if not isinstance(time_signature_map, list) or not time_signature_map:
         raise BvMidiError("header.timeSignatureMap must be a non-empty list.")
+    reject_if_over_limit(
+        len(time_signature_map),
+        MAX_TIME_SIGNATURE_EVENTS,
+        "Time signature event count",
+    )
     previous_time = -1.0
     for index, item in enumerate(time_signature_map):
         if not isinstance(item, dict):
@@ -321,11 +356,15 @@ def load_tracks(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         raise BvMidiError(f"Unexpected BV track(s): {', '.join(extra)}")
 
     normalized: dict[str, list[dict[str, Any]]] = {}
+    total_notes = 0
     for track_name in EXPECTED_TRACKS:
         notes = tracks[track_name]
         if not isinstance(notes, list):
             raise BvMidiError(f"Track {track_name} must be a list.")
+        reject_if_over_limit(len(notes), MAX_NOTES_PER_TRACK, f"Track {track_name} note count")
+        total_notes += len(notes)
         normalized[track_name] = notes
+    reject_if_over_limit(total_notes, MAX_TOTAL_NOTES, "Total BV note count")
     return normalized
 
 
@@ -491,6 +530,8 @@ def validate_melody_aligned_harmonies(
 def vlq(value: int) -> bytes:
     if value < 0:
         raise BvMidiError(f"Cannot write negative delta time: {value}")
+    if value > MAX_MIDI_VLQ:
+        raise BvMidiError(f"MIDI variable-length value exceeds limit of {MAX_MIDI_VLQ}: {value}")
     parts = [value & 0x7F]
     value >>= 7
     while value:
@@ -519,7 +560,13 @@ def track_chunk(events: list[tuple[int, int, bytes]], end_tick: int) -> bytes:
 
 
 def beats_to_ticks(beats: float, ticks_per_beat: int) -> int:
-    return round(beats * ticks_per_beat)
+    ticks = beats * ticks_per_beat
+    if not math.isfinite(ticks):
+        raise BvMidiError("MIDI tick position must be finite.")
+    rounded = round(ticks)
+    if rounded > MAX_MIDI_VLQ:
+        raise BvMidiError(f"MIDI tick position exceeds limit of {MAX_MIDI_VLQ}: {rounded}")
+    return rounded
 
 
 def conductor_track(header: dict[str, Any], ticks_per_beat: int, end_tick: int) -> bytes:
@@ -580,12 +627,21 @@ def write_midi(
         raise BvMidiError(f"Output MIDI file already exists: {path}")
 
     header_duration = float(header.get("duration", 0) or 0)
-    end_beats = max(header_duration, max_note_end)
-    for item in header["tempoMap"]:
-        end_beats = max(end_beats, float(item["time"]))
-    for item in header["timeSignatureMap"]:
-        end_beats = max(end_beats, float(item["time"]))
-    end_tick = beats_to_ticks(end_beats, ticks_per_beat)
+    if max_note_end > header_duration + 1e-9:
+        raise BvMidiError(
+            f"header.duration={normalize_number(header_duration)} is shorter than "
+            f"the latest BV note end={normalize_number(max_note_end)}."
+        )
+    latest_header_event = max(
+        max(float(item["time"]) for item in header["tempoMap"]),
+        max(float(item["time"]) for item in header["timeSignatureMap"]),
+    )
+    if latest_header_event > header_duration + 1e-9:
+        raise BvMidiError(
+            f"header.duration={normalize_number(header_duration)} is shorter than "
+            f"the latest tempo or time signature event={normalize_number(latest_header_event)}."
+        )
+    end_tick = beats_to_ticks(header_duration, ticks_per_beat)
 
     chunks = [conductor_track(header, ticks_per_beat, end_tick)]
     for track_name in EXPECTED_TRACKS:
