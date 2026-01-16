@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "script" / "bv_raw_to_midi.py"
+MIDI_TO_JSON_SCRIPT_PATH = ROOT / "script" / "midi_to_json.py"
 
 
 def load_bv_raw_to_midi_module() -> Any:
@@ -27,6 +28,19 @@ def load_bv_raw_to_midi_module() -> Any:
 
 
 bv_raw_to_midi = load_bv_raw_to_midi_module()
+
+
+def load_midi_to_json_module() -> Any:
+    spec = importlib.util.spec_from_file_location("bv_test_midi_to_json", MIDI_TO_JSON_SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load module from {MIDI_TO_JSON_SCRIPT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+midi_to_json = load_midi_to_json_module()
 
 
 EXPECTED_TRACKS = (
@@ -127,11 +141,14 @@ class BvRawToMidiTest(unittest.TestCase):
 
             output_path = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
             data = output_path.read_bytes()
+            ticks_per_beat, parsed_tracks, _, _ = midi_to_json.parse_midi(output_path)
 
         self.assertEqual(data[:4], b"MThd")
         self.assertEqual(int.from_bytes(data[8:10], "big"), 1)
         self.assertEqual(int.from_bytes(data[10:12], "big"), 12)
         self.assertEqual(int.from_bytes(data[12:14], "big"), 480)
+        self.assertEqual(ticks_per_beat, 480)
+        self.assertEqual(len(parsed_tracks), 12)
 
     def test_uses_sibling_melody_header_when_bv_header_is_missing(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -218,6 +235,47 @@ class BvRawToMidiTest(unittest.TestCase):
 
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "does not exist"):
                 bv_raw_to_midi.convert_bv_raw_to_midi(missing_path)
+
+    def test_rejects_json_file_larger_than_limit(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "too-large.json"
+            path.write_text("{}", encoding="utf-8")
+
+            with (
+                patch.object(bv_raw_to_midi, "MAX_JSON_FILE_BYTES", 1),
+                self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "JSON file size exceeds limit"),
+            ):
+                bv_raw_to_midi.read_json(path)
+
+    def test_rejects_invalid_utf8_and_extreme_json_integer(self) -> None:
+        cases = [
+            (b"\xff", "must use UTF-8"),
+            (b'{"value": ' + b"9" * 5000 + b"}", "Invalid JSON file"),
+        ]
+
+        for raw, message in cases:
+            with self.subTest(message=message), TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "invalid.json"
+                path.write_bytes(raw)
+
+                with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, message):
+                    bv_raw_to_midi.read_json(path)
+
+    def test_rejects_extreme_numeric_string_without_crashing(self) -> None:
+        with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "must be an integer"):
+            bv_raw_to_midi.require_int(
+                {"midi": "9" * 5000},
+                "midi",
+                "note",
+            )
+
+    def test_rejects_numeric_value_that_overflows_float_conversion(self) -> None:
+        with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "must be a number"):
+            bv_raw_to_midi.require_number(
+                {"duration": 10**400},
+                "duration",
+                "header",
+            )
 
     def test_rejects_invalid_input_format(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -336,6 +394,94 @@ class BvRawToMidiTest(unittest.TestCase):
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "numerator must be at most 255"):
                 bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
+    def test_rejects_header_event_count_limits(self) -> None:
+        cases = [
+            (
+                "tempoMap",
+                [{"time": 0, "bpm": 120}, {"time": 1, "bpm": 120}],
+                "MAX_TEMPO_EVENTS",
+                "Tempo event count exceeds limit",
+            ),
+            (
+                "timeSignatureMap",
+                [
+                    {"time": 0, "numerator": 4, "denominator": 4},
+                    {"time": 4, "numerator": 4, "denominator": 4},
+                ],
+                "MAX_TIME_SIGNATURE_EVENTS",
+                "Time signature event count exceeds limit",
+            ),
+        ]
+
+        for field, values, limit_name, message in cases:
+            with self.subTest(field=field), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                bv_path = root / "bv_raw.json"
+                broken_header = header()
+                broken_header[field] = values
+                bv_path.write_text(
+                    json.dumps({"header": broken_header, "tracks": tracks()}),
+                    encoding="utf-8",
+                )
+
+                with (
+                    patch.object(bv_raw_to_midi, limit_name, 1),
+                    self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, message),
+                ):
+                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_per_track_and_global_note_count_limits(self) -> None:
+        cases = [
+            ("MAX_NOTES_PER_TRACK", 1, "Track LeadDouble note count exceeds limit"),
+            ("MAX_TOTAL_NOTES", 1, "Total BV note count exceeds limit"),
+        ]
+
+        for limit_name, limit, message in cases:
+            with self.subTest(limit_name=limit_name), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                bv_path = root / "bv_raw.json"
+                bv_path.write_text(
+                    json.dumps({"header": header(), "tracks": tracks()}),
+                    encoding="utf-8",
+                )
+
+                with (
+                    patch.object(bv_raw_to_midi, limit_name, limit),
+                    self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, message),
+                ):
+                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_source_melody_and_control_count_limits(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_path = root / "melody.json"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "header": header(),
+                        "melody": melody(),
+                        "control": [
+                            {"section": "verse", "time": 0, "duration": 1},
+                            {"section": "chorus", "time": 1, "duration": 1},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            bv_path = root / "bv_raw.json"
+
+            with (
+                patch.object(bv_raw_to_midi, "MAX_SOURCE_MELODY_NOTES", 1),
+                self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "Source melody note count"),
+            ):
+                bv_raw_to_midi.sibling_melody(bv_path)
+
+            with (
+                patch.object(bv_raw_to_midi, "MAX_CONTROL_EVENTS", 1),
+                self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "Control event count"),
+            ):
+                bv_raw_to_midi.sibling_control(bv_path)
+
     def test_rejects_ticks_per_beat_that_sets_smpte_division_bit(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -347,6 +493,64 @@ class BvRawToMidiTest(unittest.TestCase):
 
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "between 1 and 32767"):
                 bv_raw_to_midi.convert_bv_raw_to_midi(bv_path, ticks_per_beat=65536)
+
+    def test_rejects_header_duration_shorter_than_latest_note_end(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            short_header = header()
+            short_header["duration"] = 1
+            bv_path.write_text(
+                json.dumps({"header": short_header, "tracks": tracks()}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "shorter than the latest BV note"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_header_event_after_duration(self) -> None:
+        cases = [
+            ("tempoMap", [{"time": 0, "bpm": 120}, {"time": 8, "bpm": 96}]),
+            (
+                "timeSignatureMap",
+                [
+                    {"time": 0, "numerator": 4, "denominator": 4},
+                    {"time": 8, "numerator": 3, "denominator": 4},
+                ],
+            ),
+        ]
+
+        for field, values in cases:
+            with self.subTest(field=field), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                bv_path = root / "bv_raw.json"
+                broken_header = header()
+                broken_header[field] = values
+                bv_path.write_text(
+                    json.dumps({"header": broken_header, "tracks": tracks()}),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    bv_raw_to_midi.BvMidiError,
+                    "shorter than the latest tempo or time signature event",
+                ):
+                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_midi_delta_that_exceeds_vlq_limit(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            huge_header = header()
+            huge_header["duration"] = (bv_raw_to_midi.MAX_MIDI_VLQ + 1) / 480
+            empty_tracks = {name: [] for name in EXPECTED_TRACKS}
+            bv_path.write_text(
+                json.dumps({"header": huge_header, "tracks": empty_tracks}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "tick position exceeds"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
     def test_rejects_time_signature_change_off_previous_bar_boundary(self) -> None:
         with TemporaryDirectory() as temp_dir:

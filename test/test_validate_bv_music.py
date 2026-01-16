@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,6 +200,38 @@ class ValidateBvMusicTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertFalse(report["passed"])
         self.assertIn("must contain a melody list", report["hardErrors"][0])
+
+    def test_fails_when_source_melody_or_control_exceeds_limit(self) -> None:
+        cases = [
+            ("MAX_SOURCE_MELODY_NOTES", "Source melody note count"),
+            ("MAX_CONTROL_EVENTS", "Control event count"),
+        ]
+
+        for limit_name, message in cases:
+            with self.subTest(limit_name=limit_name), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                bv_path = self.write_project(root, tracks())
+                if limit_name == "MAX_CONTROL_EVENTS":
+                    (root / "melody.json").write_text(
+                        json.dumps(
+                            {
+                                "header": header(),
+                                "melody": melody(),
+                                "control": [
+                                    {"section": "verse", "time": 0, "duration": 1},
+                                    {"section": "chorus", "time": 1, "duration": 1},
+                                ],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                with patch.object(validate_bv_music.bv_raw_to_midi, limit_name, 1):
+                    report, exit_code = validate_bv_music.validate(bv_path, min_score=80)
+
+                self.assertEqual(exit_code, 1)
+                self.assertFalse(report["passed"])
+                self.assertIn(message, report["hardErrors"][0])
 
     def test_reports_soft_scoring_side_input_errors_without_crashing(self) -> None:
         with TemporaryDirectory() as temp_dir:
