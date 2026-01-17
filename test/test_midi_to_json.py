@@ -728,6 +728,59 @@ class MidiToJsonTest(unittest.TestCase):
             with self.assertRaisesRegex(midi_to_json.MidiParseError, "7 trailing byte"):
                 midi_to_json.parse_midi(input_path)
 
+    def test_rejects_track_without_end_of_track_event(self) -> None:
+        payload = meta_event(0, 0x03, b"melody")
+
+        with self.assertRaisesRegex(midi_to_json.MidiParseError, "missing End-of-Track"):
+            midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+
+    def test_rejects_non_empty_end_of_track_payload(self) -> None:
+        payload = meta_event(0, 0x2F, b"x")
+
+        with self.assertRaisesRegex(midi_to_json.MidiParseError, "payload must be empty"):
+            midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+
+    def test_rejects_data_or_duplicate_event_after_end_of_track(self) -> None:
+        cases = [
+            meta_event(0, 0x2F, b"") + meta_event(0, 0x03, b"late"),
+            meta_event(0, 0x2F, b"") + meta_event(0, 0x2F, b""),
+        ]
+
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                midi_to_json.MidiParseError,
+                "data found after End-of-Track",
+            ):
+                midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+
+    def test_pairs_nested_same_pitch_notes_in_fifo_order(self) -> None:
+        payload = (
+            b"\x00\x90\x3c\x40"
+            + b"\x0a\x90\x3c\x40"
+            + b"\x0a\x80\x3c\x00"
+            + b"\x0a\x80\x3c\x00"
+            + meta_event(0, 0x2F, b"")
+        )
+
+        track, _, _, _ = midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+
+        self.assertEqual(
+            [(note.start_ticks, note.end_ticks) for note in track.notes],
+            [(0, 20), (10, 30)],
+        )
+
+    def test_handles_many_nested_same_pitch_notes(self) -> None:
+        note_count = 10_000
+        payload = (
+            b"\x00\x90\x3c\x40" * note_count
+            + b"\x00\x80\x3c\x00" * note_count
+            + meta_event(0, 0x2F, b"")
+        )
+
+        track, _, _, _ = midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+
+        self.assertEqual(len(track.notes), note_count)
+
     def test_rejects_midi_with_too_many_events_during_track_parse(self) -> None:
         midi_bytes = midi_file(
             [

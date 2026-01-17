@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import sys
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -172,8 +173,9 @@ def parse_track(
     notes: list[RawNote] = []
     tempo_events: list[TempoEvent] = []
     time_signature_events: list[TimeSignatureEvent] = []
-    active_notes: dict[tuple[int, int], list[int]] = {}
+    active_notes: dict[tuple[int, int], deque[int]] = {}
     event_order = event_order_start
+    saw_end_of_track = False
 
     while offset < len(data):
         reject_if_over_limit(event_order + 1, MAX_MIDI_EVENTS, "event count")
@@ -202,6 +204,14 @@ def parse_track(
             length, offset = read_var_len(data, offset)
             payload, offset = read_exact(data, offset, length, "meta payload")
 
+            if meta_type == 0x2F:
+                if payload:
+                    raise MidiParseError(f"Track {track_index}: End-of-Track payload must be empty.")
+                if offset != len(data):
+                    raise MidiParseError(f"Track {track_index}: data found after End-of-Track event.")
+                saw_end_of_track = True
+                event_order += 1
+                break
             if meta_type == 0x03:
                 track_name = decode_text(payload)
             elif meta_type == 0x51 and length == 3:
@@ -247,17 +257,20 @@ def parse_track(
             key = (channel, note)
             is_note_on = message_type == 0x90 and velocity > 0
             if is_note_on:
-                active_notes.setdefault(key, []).append(abs_ticks)
+                active_notes.setdefault(key, deque()).append(abs_ticks)
             else:
                 starts = active_notes.get(key)
                 if starts:
-                    start_ticks = starts.pop(0)
+                    start_ticks = starts.popleft()
                     if not starts:
                         del active_notes[key]
                     display_name = track_name or f"track_{track_index}"
                     notes.append(RawNote(display_name, note, start_ticks, abs_ticks))
                     reject_if_over_limit(len(notes), MAX_PARSED_NOTES, "parsed note count")
         event_order += 1
+
+    if not saw_end_of_track:
+        raise MidiParseError(f"Track {track_index}: missing End-of-Track event.")
 
     if active_notes:
         pending = []
