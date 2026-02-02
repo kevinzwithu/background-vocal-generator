@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import sys
+import tempfile
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -825,8 +826,47 @@ def build_header(
     }
 
 
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+def remove_temp_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def prepare_temp_text(path: Path, text: str) -> Path:
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(text)
+        return temp_path
+    except Exception:
+        if temp_path is not None:
+            remove_temp_file(temp_path)
+        raise
+
+
+def write_json_files(outputs: list[tuple[Path, dict[str, Any]]]) -> None:
+    serialized = [
+        (path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        for path, payload in outputs
+    ]
+    prepared: list[tuple[Path, Path]] = []
+    try:
+        for path, text in serialized:
+            prepared.append((prepare_temp_text(path, text), path))
+        for temp_path, path in prepared:
+            temp_path.replace(path)
+    finally:
+        for temp_path, _ in prepared:
+            remove_temp_file(temp_path)
 
 
 def output_dir_for_midi(input_path: Path, output_root: Path) -> Path:
@@ -916,9 +956,13 @@ def convert_midi_to_json(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    write_json(output_dir / "canonical.json", canonical)
-    write_json(output_dir / "melody.json", melody_payload)
-    write_json(output_dir / "chord.json", {"header": header, "chord": chord_notes})
+    write_json_files(
+        [
+            (output_dir / "canonical.json", canonical),
+            (output_dir / "melody.json", melody_payload),
+            (output_dir / "chord.json", {"header": header, "chord": chord_notes}),
+        ]
+    )
 
     if filtered_melody or filtered_chord:
         print(
@@ -975,7 +1019,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     output_dir = output_dir_for_midi(input_path, output_root)
-    existing_outputs = existing_output_json_paths(output_dir)
+    try:
+        existing_outputs = existing_output_json_paths(output_dir)
+    except OSError as exc:
+        print(f"ERROR: Unable to inspect output JSON files in {output_dir}: {exc}", file=sys.stderr)
+        return 2
     if existing_outputs and not confirm_overwrite(existing_outputs):
         print(f"Canceled: output JSON file(s) already exist in {output_dir}", file=sys.stderr)
         return 2

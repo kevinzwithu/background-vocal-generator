@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,30 @@ class TimeSignatureSegment:
     denominator: int
     bar_length: float
     grid_size: float
+
+
+def remove_temp_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def write_bytes_atomically(path: Path, payload: bytes) -> None:
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(payload)
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None:
+            remove_temp_file(temp_path)
 
 
 def normalize_number(value: float, digits: int = 6) -> int | float:
@@ -655,7 +680,7 @@ def write_midi(
     midi_header = b"MThd" + len(midi_header_payload).to_bytes(4, "big") + midi_header_payload
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(midi_header + b"".join(chunks))
+    write_bytes_atomically(path, midi_header + b"".join(chunks))
 
 
 def convert_bv_raw_to_midi(

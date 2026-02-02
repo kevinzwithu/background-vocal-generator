@@ -652,6 +652,26 @@ class BvRawToMidiTest(unittest.TestCase):
                 )
             self.assertEqual(output_path.read_bytes(), b"existing")
 
+    def test_atomic_write_failure_preserves_existing_output(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            output_path = root / "custom.mid"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": tracks()}),
+                encoding="utf-8",
+            )
+            output_path.write_bytes(b"existing")
+
+            with (
+                patch.object(Path, "replace", side_effect=OSError("replace failed")),
+                self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path, output_path=output_path)
+
+            self.assertEqual(output_path.read_bytes(), b"existing")
+            self.assertEqual(list(root.glob(".*.tmp")), [])
+
     def test_main_handles_input_inspect_os_error(self) -> None:
         stderr = io.StringIO()
 

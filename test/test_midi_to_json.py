@@ -913,6 +913,66 @@ class MidiToJsonTest(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertIn("ERROR: disk full", stderr.getvalue())
 
+    def test_main_handles_output_inspect_os_error(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "song.mid"
+            input_path.write_bytes(b"MThd")
+            stderr = io.StringIO()
+
+            with (
+                patch.object(
+                    midi_to_json,
+                    "existing_output_json_paths",
+                    side_effect=OSError("stat failed"),
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = midi_to_json.main([str(input_path)])
+
+            self.assertEqual(result, 2)
+            self.assertIn("Unable to inspect output JSON files", stderr.getvalue())
+            self.assertIn("stat failed", stderr.getvalue())
+
+    def test_json_prepare_failure_preserves_all_existing_outputs(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, TICKS_PER_BEAT, 60)]),
+                track_chunk("chord", [(0, TICKS_PER_BEAT, 48), (0, TICKS_PER_BEAT, 52)]),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            output_dir = root / "output" / "song"
+            input_path.write_bytes(midi_bytes)
+            output_dir.mkdir(parents=True)
+            original_contents = {
+                output_dir / name: f"existing {name}" for name in midi_to_json.OUTPUT_JSON_FILENAMES
+            }
+            for path, content in original_contents.items():
+                path.write_text(content, encoding="utf-8")
+
+            real_prepare = midi_to_json.prepare_temp_text
+            call_count = 0
+
+            def fail_second_prepare(path: Path, text: str) -> Path:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 2:
+                    raise OSError("disk full")
+                return real_prepare(path, text)
+
+            with (
+                patch.object(midi_to_json, "prepare_temp_text", side_effect=fail_second_prepare),
+                self.assertRaisesRegex(OSError, "disk full"),
+            ):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+            for path, content in original_contents.items():
+                self.assertEqual(path.read_text(encoding="utf-8"), content)
+            self.assertEqual(list(output_dir.glob(".*.tmp")), [])
+
     def test_main_cancels_when_output_json_exists_and_user_does_not_confirm(self) -> None:
         midi_bytes = midi_file(
             [
