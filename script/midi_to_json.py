@@ -50,7 +50,6 @@ class MidiValidationError(Exception):
 
 @dataclass(frozen=True)
 class RawNote:
-    track_name: str
     midi: int
     start_ticks: int
     end_ticks: int
@@ -92,11 +91,6 @@ def read_exact(data: bytes, offset: int, size: int, label: str) -> tuple[bytes, 
     if end > len(data):
         raise MidiParseError(f"Unexpected end of file while reading {label}.")
     return data[offset:end], end
-
-
-def read_u16(data: bytes, offset: int) -> tuple[int, int]:
-    raw, offset = read_exact(data, offset, 2, "uint16")
-    return int.from_bytes(raw, "big"), offset
 
 
 def read_u32(data: bytes, offset: int) -> tuple[int, int]:
@@ -265,8 +259,7 @@ def parse_track(
                     start_ticks = starts.popleft()
                     if not starts:
                         del active_notes[key]
-                    display_name = track_name or f"track_{track_index}"
-                    notes.append(RawNote(display_name, note, start_ticks, abs_ticks))
+                    notes.append(RawNote(note, start_ticks, abs_ticks))
                     reject_if_over_limit(len(notes), MAX_PARSED_NOTES, "parsed note count")
         event_order += 1
 
@@ -365,16 +358,16 @@ def ticks_to_beats(ticks: int, ticks_per_beat: int) -> float:
 
 
 def normalize_tempo_map(events: list[TempoEvent], ticks_per_beat: int) -> list[dict[str, Any]]:
-    by_time: dict[float, tuple[int | float, int]] = {}
+    by_time: dict[float, int | float] = {}
     for event in sorted(events, key=lambda item: (item.ticks, item.order)):
-        by_time[ticks_to_beats(event.ticks, ticks_per_beat)] = (event.bpm, event.order)
+        by_time[ticks_to_beats(event.ticks, ticks_per_beat)] = event.bpm
 
     if 0.0 not in by_time:
-        by_time[0.0] = (120, -1)
+        by_time[0.0] = 120
 
     return [
         {"time": normalize_number(time), "bpm": bpm}
-        for time, (bpm, _) in sorted(by_time.items(), key=lambda item: item[0])
+        for time, bpm in sorted(by_time.items())
     ]
 
 
@@ -382,16 +375,12 @@ def normalize_time_signature_map(
     events: list[TimeSignatureEvent],
     ticks_per_beat: int,
 ) -> list[dict[str, Any]]:
-    by_time: dict[float, tuple[int, int, int]] = {}
+    by_time: dict[float, tuple[int, int]] = {}
     for event in sorted(events, key=lambda item: (item.ticks, item.order)):
-        by_time[ticks_to_beats(event.ticks, ticks_per_beat)] = (
-            event.numerator,
-            event.denominator,
-            event.order,
-        )
+        by_time[ticks_to_beats(event.ticks, ticks_per_beat)] = (event.numerator, event.denominator)
 
     if 0.0 not in by_time:
-        by_time[0.0] = (4, 4, -1)
+        by_time[0.0] = (4, 4)
 
     return [
         {
@@ -399,7 +388,7 @@ def normalize_time_signature_map(
             "numerator": numerator,
             "denominator": denominator,
         }
-        for time, (numerator, denominator, _) in sorted(by_time.items(), key=lambda item: item[0])
+        for time, (numerator, denominator) in sorted(by_time.items())
     ]
 
 
@@ -476,26 +465,6 @@ def bar_position(segments: list[TimeSignatureSegment], time: float) -> tuple[int
     return segment.start_bar + bar_offset, normalize_number(beat), grid
 
 
-def select_named_track(tracks: list[TrackData], expected_name: str) -> TrackData:
-    matches = [
-        track
-        for track in tracks
-        if track.name is not None and track.name.strip().lower() == expected_name.lower()
-    ]
-    if not matches:
-        available = ", ".join(track.name or "<unnamed>" for track in tracks)
-        raise MidiValidationError(
-            f"Missing required MIDI track '{expected_name}'. Available tracks: {available}"
-        )
-    if len(matches) > 1:
-        raise MidiValidationError(f"Multiple MIDI tracks named '{expected_name}' were found.")
-    return matches[0]
-
-
-def non_empty_tracks(tracks: list[TrackData]) -> list[TrackData]:
-    return [track for track in tracks if track.notes]
-
-
 def validate_required_track_set(tracks: list[TrackData]) -> None:
     available = ", ".join(track.name or "<unnamed>" for track in tracks)
     normalized_names = [
@@ -512,15 +481,6 @@ def validate_required_track_set(tracks: list[TrackData]) -> None:
         )
     if normalized_names.count("control") > 1:
         raise MidiValidationError("MIDI must not contain more than one non-empty 'control' track.")
-
-
-def optional_named_track(tracks: list[TrackData], expected_name: str) -> TrackData | None:
-    matches = [
-        track
-        for track in tracks
-        if track.name is not None and track.name.strip().lower() == expected_name.lower()
-    ]
-    return matches[0] if matches else None
 
 
 def convert_notes(
@@ -654,13 +614,7 @@ def convert_control_notes(
 
 
 def validate_chord_alignment(notes: list[dict[str, Any]], tolerance: float) -> None:
-    groups: dict[float, list[dict[str, Any]]] = {}
-    for note in notes:
-        start = float(note["time"])
-        key = round(start / max(tolerance, 1e-9)) * max(tolerance, 1e-9)
-        groups.setdefault(key, []).append(note)
-
-    for group in groups.values():
+    for group in group_notes_by_start(notes, tolerance):
         if len(group) <= 1:
             continue
         expected_end = float(group[0]["time"]) + float(group[0]["duration"])
@@ -702,14 +656,8 @@ def filter_non_chord_groups(
     notes: list[dict[str, Any]],
     tolerance: float,
 ) -> list[dict[str, Any]]:
-    grouped_notes: dict[float, list[dict[str, Any]]] = {}
-    for note in notes:
-        start = float(note["time"])
-        key = round(start / max(tolerance, 1e-9)) * max(tolerance, 1e-9)
-        grouped_notes.setdefault(key, []).append(note)
-
     chord_notes: list[dict[str, Any]] = []
-    for group in grouped_notes.values():
+    for group in group_notes_by_start(notes, tolerance):
         pitch_classes = {int(note["midi"]) % 12 for note in group}
         if len(pitch_classes) > 1:
             chord_notes.extend(group)
@@ -737,15 +685,10 @@ def note_end(note: dict[str, Any]) -> float:
 
 
 def count_bars(duration: float, segments: list[TimeSignatureSegment]) -> int:
-    if duration <= 0:
-        return 0
-
     bar_count = 0
     for index, segment in enumerate(segments):
         next_start = segments[index + 1].start if index + 1 < len(segments) else duration
         segment_end = min(duration, next_start)
-        if segment_end <= segment.start:
-            continue
         elapsed = segment_end - segment.start
         bar_count += math.ceil((elapsed - 1e-9) / segment.bar_length)
         if duration <= next_start:
@@ -761,8 +704,6 @@ def duration_seconds(duration: float, tempo_map: list[dict[str, Any]]) -> float:
             break
         end = float(tempo_map[index + 1]["time"]) if index + 1 < len(tempo_map) else duration
         segment_end = min(duration, end)
-        if segment_end <= start:
-            continue
         seconds += (segment_end - start) * 60 / float(item["bpm"])
     return seconds
 
@@ -812,9 +753,7 @@ def build_header(
     tempo_map: list[dict[str, Any]],
     time_signature_map: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    duration = 0.0
-    for note in melody_notes + chord_notes:
-        duration = max(duration, float(note["time"]) + float(note["duration"]))
+    duration = max((note_end(note) for note in melody_notes + chord_notes), default=0.0)
 
     return {
         "startTime": 0,
@@ -899,12 +838,17 @@ def convert_midi_to_json(
         require_no_existing_outputs(output_dir)
 
     ticks_per_beat, tracks, tempo_events, time_signature_events = parse_midi(input_path)
-    music_tracks = non_empty_tracks(tracks)
+    music_tracks = [track for track in tracks if track.notes]
 
     validate_required_track_set(music_tracks)
-    melody_track = select_named_track(music_tracks, "melody")
-    chord_track = select_named_track(music_tracks, "chord")
-    control_track = optional_named_track(music_tracks, "control")
+    tracks_by_name = {
+        track.name.strip().lower(): track
+        for track in music_tracks
+        if track.name is not None
+    }
+    melody_track = tracks_by_name["melody"]
+    chord_track = tracks_by_name["chord"]
+    control_track = tracks_by_name.get("control")
 
     tempo_map = normalize_tempo_map(tempo_events, ticks_per_beat)
     time_signature_map = normalize_time_signature_map(time_signature_events, ticks_per_beat)
