@@ -380,7 +380,6 @@ def load_tracks(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     if extra:
         raise BvMidiError(f"Unexpected BV track(s): {', '.join(extra)}")
 
-    normalized: dict[str, list[dict[str, Any]]] = {}
     total_notes = 0
     for track_name in EXPECTED_TRACKS:
         notes = tracks[track_name]
@@ -388,9 +387,8 @@ def load_tracks(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
             raise BvMidiError(f"Track {track_name} must be a list.")
         reject_if_over_limit(len(notes), MAX_NOTES_PER_TRACK, f"Track {track_name} note count")
         total_notes += len(notes)
-        normalized[track_name] = notes
     reject_if_over_limit(total_notes, MAX_TOTAL_NOTES, "Total BV note count")
-    return normalized
+    return {name: tracks[name] for name in EXPECTED_TRACKS}
 
 
 def validate_notes(
@@ -404,11 +402,10 @@ def validate_notes(
         for note in notes:
             if not isinstance(note, dict):
                 raise BvMidiError(f"Track {track_name} contains a non-object note.")
-            for key in ("name", "midi", "time", "duration"):
-                if key not in note:
-                    raise BvMidiError(f"Track {track_name} note is missing '{key}'.")
 
             label = f"Track {track_name} note"
+            if "name" not in note:
+                raise BvMidiError(f"{label} is missing 'name'.")
             midi = require_int(note, "midi", label)
             start = require_number(note, "time", label)
             duration = require_number(note, "duration", label)
@@ -452,21 +449,6 @@ def validate_notes(
     return max_end
 
 
-def note_time(note: dict[str, Any]) -> float:
-    return float(note["time"])
-
-
-def note_duration(note: dict[str, Any]) -> float:
-    return float(note["duration"])
-
-
-def same_timing(left: dict[str, Any], right: dict[str, Any], tolerance: float) -> bool:
-    return (
-        abs(note_time(left) - note_time(right)) <= tolerance
-        and abs(note_duration(left) - note_duration(right)) <= tolerance
-    )
-
-
 def validate_melody_aligned_harmonies(
     tracks: dict[str, list[dict[str, Any]]],
     melody: list[dict[str, Any]] | None,
@@ -493,19 +475,18 @@ def validate_melody_aligned_harmonies(
         if not isinstance(melody_note, dict):
             raise BvMidiError(f"Source melody note at index {index} must be an object.")
         label = f"Source melody note at index {index}"
-        for key in ("name", "midi", "time", "duration"):
-            if key not in melody_note:
-                raise BvMidiError(f"{label} is missing '{key}'.")
+        if "name" not in melody_note:
+            raise BvMidiError(f"{label} is missing 'name'.")
         require_int(melody_note, "midi", label)
         require_number(melody_note, "time", label)
         require_number(melody_note, "duration", label)
 
-    for track_name in ("LeadDouble",):
-        if len(tracks[track_name]) != len(melody):
-            raise BvMidiError(
-                f"{track_name} must contain exactly one note per melody note. "
-                f"Expected {len(melody)}, found {len(tracks[track_name])}."
-            )
+    lead_double = tracks["LeadDouble"]
+    if len(lead_double) != len(melody):
+        raise BvMidiError(
+            "LeadDouble must contain exactly one note per melody note. "
+            f"Expected {len(melody)}, found {len(lead_double)}."
+        )
 
     harmony_melody = [note for note in melody if requires_harmony(note)]
     for track_name in MELODY_ALIGNED_TRACKS:
@@ -516,7 +497,7 @@ def validate_melody_aligned_harmonies(
             )
 
     for index, melody_note in enumerate(melody):
-        lead_note = tracks["LeadDouble"][index]
+        lead_note = lead_double[index]
         for key in ("name", "midi", "time", "duration"):
             if lead_note.get(key) != melody_note.get(key):
                 raise BvMidiError(
@@ -528,7 +509,10 @@ def validate_melody_aligned_harmonies(
         melody_midi = int(melody_note["midi"])
         for track_name in MELODY_ALIGNED_TRACKS:
             harmony_note = tracks[track_name][index]
-            if not same_timing(harmony_note, melody_note, tolerance):
+            if (
+                abs(float(harmony_note["time"]) - float(melody_note["time"])) > tolerance
+                or abs(float(harmony_note["duration"]) - float(melody_note["duration"])) > tolerance
+            ):
                 raise BvMidiError(
                     f"{track_name} must align to melody timing at index {index}. "
                     f"Melody time={melody_note['time']} duration={melody_note['duration']}; "
@@ -573,13 +557,12 @@ def track_chunk(events: list[tuple[int, int, bytes]], end_tick: int) -> bytes:
     payload = bytearray()
     previous_tick = 0
 
-    sorted_events = sorted(events, key=lambda item: (item[0], item[1]))
-    for tick, _, event_payload in sorted_events:
+    for tick, _, event_payload in sorted(events, key=lambda item: (item[0], item[1])):
         payload.extend(vlq(tick - previous_tick))
         payload.extend(event_payload)
         previous_tick = tick
 
-    payload.extend(vlq(max(0, end_tick - previous_tick)))
+    payload.extend(vlq(end_tick - previous_tick))
     payload.extend(meta_event(0x2F, b""))
     return b"MTrk" + len(payload).to_bytes(4, "big") + bytes(payload)
 
@@ -595,8 +578,7 @@ def beats_to_ticks(beats: float, ticks_per_beat: int) -> int:
 
 
 def conductor_track(header: dict[str, Any], ticks_per_beat: int, end_tick: int) -> bytes:
-    events: list[tuple[int, int, bytes]] = []
-    events.append((0, 0, meta_event(0x03, b"conductor")))
+    events: list[tuple[int, int, bytes]] = [(0, 0, meta_event(0x03, b"conductor"))]
 
     for item in header["tempoMap"]:
         tick = beats_to_ticks(float(item["time"]), ticks_per_beat)
