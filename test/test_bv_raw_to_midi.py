@@ -537,6 +537,37 @@ class BvRawToMidiTest(unittest.TestCase):
                 ):
                     bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
+    def test_rejects_arrangements_over_piece_limits(self) -> None:
+        cases = [
+            (
+                {
+                    **header(),
+                    "duration": 4 * 251,
+                    "tempoMap": [{"time": 0, "bpm": 240}],
+                },
+                "250 bars",
+            ),
+            (
+                {
+                    **header(),
+                    "duration": 4 * 249,
+                    "tempoMap": [{"time": 0, "bpm": 96}],
+                },
+                "10 minutes",
+            ),
+        ]
+
+        for broken_header, message in cases:
+            with self.subTest(message=message), TemporaryDirectory() as temp_dir:
+                bv_path = Path(temp_dir) / "bv_raw.json"
+                bv_path.write_text(
+                    json.dumps({"header": broken_header, "tracks": tracks()}),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, message):
+                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
     def test_rejects_midi_delta_that_exceeds_vlq_limit(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -549,7 +580,11 @@ class BvRawToMidiTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "tick position exceeds"):
+            with (
+                patch.object(bv_raw_to_midi, "MAX_BARS", 10**9),
+                patch.object(bv_raw_to_midi, "MAX_SECONDS", 10**9),
+                self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "tick position exceeds"),
+            ):
                 bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
     def test_rejects_time_signature_change_off_previous_bar_boundary(self) -> None:

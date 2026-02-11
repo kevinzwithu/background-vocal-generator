@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import unittest
@@ -331,6 +332,78 @@ class ValidateBvMusicTest(unittest.TestCase):
             events = validate_bv_music.chord_events(note_txt, tempo_header)
 
         self.assertEqual([(time, chord) for time, _, chord in events], [(0, "C"), (4, "F")])
+
+    def test_chord_events_rejects_note_txt_larger_than_limit(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            note_txt = Path(temp_dir) / "note.txt"
+            note_txt.write_bytes(b"x" * 17)
+
+            with (
+                patch.object(validate_bv_music, "MAX_NOTE_TXT_FILE_BYTES", 16),
+                self.assertRaisesRegex(ValueError, "note.txt file size exceeds limit"),
+            ):
+                validate_bv_music.chord_events(note_txt, header())
+
+    def test_read_note_text_rejects_file_that_grows_after_size_inspection(self) -> None:
+        class GrowingNotePath:
+            def exists(self) -> bool:
+                return True
+
+            def is_file(self) -> bool:
+                return True
+
+            def stat(self) -> Any:
+                return type("Stat", (), {"st_size": 1})()
+
+            def open(self, mode: str) -> Any:
+                self.mode = mode
+                return io.BytesIO(b"x" * (validate_bv_music.MAX_NOTE_TXT_FILE_BYTES + 1))
+
+        with self.assertRaisesRegex(ValueError, "note.txt file size exceeds limit"):
+            validate_bv_music.read_note_text(GrowingNotePath())
+
+    def test_chord_events_rejects_arrangements_over_length_limits(self) -> None:
+        cases = [
+            (
+                {
+                    **header(),
+                    "duration": 4 * 251,
+                    "tempoMap": [{"time": 0, "bpm": 240}],
+                },
+                "250 bars",
+            ),
+            (
+                {
+                    **header(),
+                    "duration": 4 * 249,
+                    "tempoMap": [{"time": 0, "bpm": 96}],
+                },
+                "10 minutes",
+            ),
+        ]
+
+        for chart_header, message in cases:
+            with self.subTest(message=message), TemporaryDirectory() as temp_dir:
+                note_txt = Path(temp_dir) / "note.txt"
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_bv_music.chord_events(note_txt, chart_header)
+
+    def test_active_chord_uses_logarithmic_lookup(self) -> None:
+        class CountingEvents(list[tuple[float, set[int] | None, str]]):
+            def __init__(self, values: list[tuple[float, set[int] | None, str]]) -> None:
+                super().__init__(values)
+                self.lookups = 0
+
+            def __getitem__(self, index: int) -> tuple[float, set[int] | None, str]:
+                self.lookups += 1
+                return super().__getitem__(index)
+
+        events = CountingEvents([(float(index), {0, 4, 7}, "C") for index in range(4096)])
+
+        chord = validate_bv_music.active_chord(events, 3000.5)
+
+        self.assertEqual(chord, ({0, 4, 7}, "C"))
+        self.assertLessEqual(events.lookups, 20)
 
     def test_chord_events_rejects_invalid_bar_and_beat_positions(self) -> None:
         cases = [

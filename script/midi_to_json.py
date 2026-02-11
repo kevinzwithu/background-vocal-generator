@@ -21,8 +21,8 @@ from typing import Any
 C0_MIDI = 12
 C6_MIDI = 84
 MAX_BARS = 250
-MAX_SECONDS = 8 * 60
-MAX_MIDI_FILE_BYTES = 5 * 1024 * 1024
+MAX_SECONDS = 10 * 60
+MAX_MIDI_FILE_BYTES = 100 * 1024
 MAX_TRACKS = 64
 MAX_MIDI_EVENTS = 200_000
 MAX_PARSED_NOTES = 50_000
@@ -285,9 +285,11 @@ def parse_midi(path: Path) -> tuple[int, list[TrackData], list[TempoEvent], list
     reject_if_over_limit(file_size, MAX_MIDI_FILE_BYTES, "file size")
 
     try:
-        data = path.read_bytes()
+        with path.open("rb") as source:
+            data = source.read(MAX_MIDI_FILE_BYTES + 1)
     except OSError as exc:
         raise MidiParseError(f"Unable to read MIDI file: {exc}") from exc
+    reject_if_over_limit(len(data), MAX_MIDI_FILE_BYTES, "file size")
     offset = 0
 
     chunk_type, offset = read_exact(data, offset, 4, "MIDI header chunk type")
@@ -728,9 +730,9 @@ def validate_piece_limits(
         )
 
     seconds = duration_seconds(duration, tempo_map)
-    if seconds > MAX_SECONDS + tolerance:
+    if seconds > MAX_SECONDS:
         raise MidiValidationError(
-            f"MIDI length must not exceed 8 minutes. Found {round(seconds, 2)} seconds."
+            f"MIDI length must not exceed 10 minutes. Found {round(seconds, 2)} seconds."
         )
 
     for group in group_notes_by_start(chord_notes, tolerance):
@@ -745,6 +747,22 @@ def validate_piece_limits(
     raise MidiValidationError(
         "Chord track must contain at least one valid chord whose time range overlaps a melody note."
     )
+
+
+def validate_header_events_within_duration(
+    tempo_map: list[dict[str, Any]],
+    time_signature_map: list[dict[str, Any]],
+    duration: float,
+) -> None:
+    latest_event = max(
+        max(float(item["time"]) for item in tempo_map),
+        max(float(item["time"]) for item in time_signature_map),
+    )
+    if latest_event > duration + 1e-9:
+        raise MidiValidationError(
+            f"Header event at {normalize_number(latest_event)} beats is after "
+            f"the final note end at {normalize_number(duration)} beats."
+        )
 
 
 def build_header(
@@ -873,6 +891,11 @@ def convert_midi_to_json(
     chord_notes = filter_non_chord_groups(chord_notes, tolerance)
 
     header = build_header(melody_notes, chord_notes, tempo_map, time_signature_map)
+    validate_header_events_within_duration(
+        tempo_map,
+        time_signature_map,
+        float(header["duration"]),
+    )
     validate_piece_limits(
         melody_notes,
         chord_notes,

@@ -635,10 +635,14 @@ class MidiToJsonTest(unittest.TestCase):
             with self.assertRaisesRegex(midi_to_json.MidiValidationError, "250 bars"):
                 midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
 
-    def test_rejects_when_midi_exceeds_8_minutes(self) -> None:
+    def test_rejects_when_midi_exceeds_10_minutes(self) -> None:
         midi_bytes = midi_file(
             [
-                track_chunk("melody", [(0, TICKS_PER_BEAT * 4 * 249, 60)]),
+                track_chunk(
+                    "melody",
+                    [(0, TICKS_PER_BEAT * 4 * 249, 60)],
+                    [(0, 0x51, tempo_payload(96))],
+                ),
                 track_chunk(
                     "chord",
                     [
@@ -653,8 +657,38 @@ class MidiToJsonTest(unittest.TestCase):
             root = Path(temp_dir)
             input_path = root / "song.mid"
             input_path.write_bytes(midi_bytes)
-            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "8 minutes"):
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "10 minutes"):
                 midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+    def test_rejects_header_events_after_final_note_end(self) -> None:
+        cases = [
+            ("tempo", [(TICKS_PER_BEAT * 2, 0x51, tempo_payload(100))]),
+            (
+                "time signature",
+                [(TICKS_PER_BEAT * 4, 0x58, time_signature_payload(3, 2))],
+            ),
+        ]
+
+        for label, metas in cases:
+            with self.subTest(label=label), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                input_path = root / "song.mid"
+                input_path.write_bytes(
+                    midi_file(
+                        [
+                            track_chunk("melody", [(0, TICKS_PER_BEAT, 60)], metas),
+                            track_chunk(
+                                "chord",
+                                [(0, TICKS_PER_BEAT, 48), (0, TICKS_PER_BEAT, 52)],
+                            ),
+                        ]
+                    )
+                )
+
+                with self.assertRaisesRegex(midi_to_json.MidiValidationError, "after the final note"):
+                    midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
+                self.assertFalse((root / "output" / "song").exists())
 
     def test_rejects_midi_file_larger_than_parser_limit(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -667,6 +701,18 @@ class MidiToJsonTest(unittest.TestCase):
                 self.assertRaisesRegex(midi_to_json.MidiParseError, "file size exceeds limit"),
             ):
                 midi_to_json.parse_midi(input_path)
+
+    def test_rejects_midi_that_grows_after_size_inspection(self) -> None:
+        class GrowingMidiPath:
+            def stat(self) -> Any:
+                return type("Stat", (), {"st_size": 1})()
+
+            def open(self, mode: str) -> io.BytesIO:
+                self.mode = mode
+                return io.BytesIO(b"0" * (midi_to_json.MAX_MIDI_FILE_BYTES + 1))
+
+        with self.assertRaisesRegex(midi_to_json.MidiParseError, "file size exceeds limit"):
+            midi_to_json.parse_midi(GrowingMidiPath())
 
     def test_rejects_midi_with_too_many_tracks_before_parsing_tracks(self) -> None:
         midi_bytes = midi_file([track_chunk(None, []) for _ in range(3)])

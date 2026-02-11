@@ -15,6 +15,8 @@ from typing import Any
 
 DEFAULT_TICKS_PER_BEAT = 480
 MAX_JSON_FILE_BYTES = 5 * 1024 * 1024
+MAX_BARS = 250
+MAX_SECONDS = 10 * 60
 MAX_NOTES_PER_TRACK = 50_000
 MAX_TOTAL_NOTES = 200_000
 MAX_SOURCE_MELODY_NOTES = 50_000
@@ -368,6 +370,44 @@ def quantized(
     return abs(time - nearest) <= tolerance, nearest, segment
 
 
+def count_bars(duration: float, segments: list[TimeSignatureSegment]) -> int:
+    bar_count = 0
+    for index, segment in enumerate(segments):
+        next_start = segments[index + 1].start if index + 1 < len(segments) else duration
+        segment_end = min(duration, next_start)
+        elapsed = segment_end - segment.start
+        bar_count += math.ceil((elapsed - 1e-9) / segment.bar_length)
+        if duration <= next_start:
+            break
+    return bar_count
+
+
+def duration_seconds(duration: float, tempo_map: list[dict[str, Any]]) -> float:
+    seconds = 0.0
+    for index, item in enumerate(tempo_map):
+        start = float(item["time"])
+        if start >= duration:
+            break
+        end = float(tempo_map[index + 1]["time"]) if index + 1 < len(tempo_map) else duration
+        segment_end = min(duration, end)
+        seconds += (segment_end - start) * 60 / float(item["bpm"])
+    return seconds
+
+
+def validate_piece_limits(header: dict[str, Any], segments: list[TimeSignatureSegment]) -> None:
+    duration = float(header["duration"])
+    bar_count = count_bars(duration, segments)
+    if bar_count > MAX_BARS:
+        raise BvMidiError(
+            f"Arrangement length must not exceed {MAX_BARS} bars. Found {bar_count} bars."
+        )
+    seconds = duration_seconds(duration, header["tempoMap"])
+    if seconds > MAX_SECONDS:
+        raise BvMidiError(
+            f"Arrangement length must not exceed 10 minutes. Found {round(seconds, 2)} seconds."
+        )
+
+
 def load_tracks(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     tracks = payload.get("tracks")
     if not isinstance(tracks, dict):
@@ -678,6 +718,7 @@ def convert_bv_raw_to_midi(
     header = resolve_header(payload, bv_path)
     tracks = load_tracks(payload)
     segments = build_time_signature_segments(header)
+    validate_piece_limits(header, segments)
     max_note_end = validate_notes(tracks, segments, tolerance)
     validate_melody_aligned_harmonies(
         tracks,

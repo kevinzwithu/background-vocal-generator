@@ -19,6 +19,9 @@ import bv_raw_to_midi
 
 
 EXPECTED_NOTE_KEYS = {"name", "midi", "time", "duration"}
+MAX_NOTE_TXT_FILE_BYTES = 100 * 1024
+MAX_BARS = 250
+MAX_SECONDS = 10 * 60
 MELODY_ALIGNED_TRACKS = ("HHA", "HHB", "HHF", "LHA", "LHB", "LHF")
 CONTOUR_TRACKS = ("HHA", "HHB", "LHA", "LHB")
 HIGH_TRACKS = ("HHA", "HHB", "HHF")
@@ -282,6 +285,48 @@ def expected_bar_count(header: dict[str, Any], segments: list[TimeSignatureSegme
     return bar_key(max(0.0, duration - 1e-9), segments)
 
 
+def duration_seconds(header: dict[str, Any]) -> float:
+    duration = float(header["duration"])
+    seconds = 0.0
+    tempo_map = header["tempoMap"]
+    for index, item in enumerate(tempo_map):
+        start = float(item["time"])
+        if start >= duration:
+            break
+        end = float(tempo_map[index + 1]["time"]) if index + 1 < len(tempo_map) else duration
+        segment_end = min(duration, end)
+        seconds += (segment_end - start) * 60 / float(item["bpm"])
+    return seconds
+
+
+def read_note_text(note_txt: Path) -> str:
+    try:
+        exists = note_txt.exists()
+        is_file = note_txt.is_file() if exists else False
+    except OSError as exc:
+        raise ValueError(f"Unable to inspect note.txt {note_txt}: {exc}") from exc
+    if not exists:
+        raise FileNotFoundError(f"Missing required note.txt: {note_txt}")
+    if not is_file:
+        raise ValueError(f"note.txt path is not a file: {note_txt}")
+
+    try:
+        if note_txt.stat().st_size > MAX_NOTE_TXT_FILE_BYTES:
+            raise ValueError(
+                f"note.txt file size exceeds limit of {MAX_NOTE_TXT_FILE_BYTES} bytes."
+            )
+        with note_txt.open("rb") as source:
+            raw = source.read(MAX_NOTE_TXT_FILE_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"Unable to inspect or read note.txt {note_txt}: {exc}") from exc
+    if len(raw) > MAX_NOTE_TXT_FILE_BYTES:
+        raise ValueError(f"note.txt file size exceeds limit of {MAX_NOTE_TXT_FILE_BYTES} bytes.")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"note.txt must use UTF-8 encoding: {note_txt}") from exc
+
+
 def expected_tempo_markers(
     header: dict[str, Any],
     segments: list[TimeSignatureSegment],
@@ -306,14 +351,18 @@ def validate_markers(
 
 
 def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, set[int] | None, str]]:
-    if not note_txt.exists():
-        raise FileNotFoundError(f"Missing required note.txt: {note_txt}")
-    if not note_txt.is_file():
-        raise ValueError(f"note.txt path is not a file: {note_txt}")
     events: list[tuple[float, set[int] | None, str]] = []
     segments = build_time_signature_segments(header)
+    bar_count = expected_bar_count(header, segments)
+    if bar_count > MAX_BARS:
+        raise ValueError(f"Arrangement length must not exceed {MAX_BARS} bars. Found {bar_count} bars.")
+    seconds = duration_seconds(header)
+    if seconds > MAX_SECONDS:
+        raise ValueError(
+            f"Arrangement length must not exceed 10 minutes. Found {round(seconds, 2)} seconds."
+        )
 
-    lines = note_txt.read_text(encoding="utf-8").splitlines()
+    lines = read_note_text(note_txt).splitlines()
     non_empty = [line.strip() for line in lines if line.strip()]
     if not non_empty or non_empty[0] != "Time Unit: beats":
         raise ValueError("note.txt first non-empty line must be 'Time Unit: beats'.")
@@ -376,7 +425,6 @@ def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, se
     if not events:
         raise ValueError(f"note.txt does not contain any chord events: {note_txt}")
 
-    bar_count = expected_bar_count(header, segments)
     expected_bars = list(range(1, bar_count + 1))
     if chord_bars != expected_bars:
         raise ValueError(
@@ -393,13 +441,19 @@ def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, se
 
 
 def active_chord(events: list[tuple[float, set[int] | None, str]], time: float) -> tuple[set[int] | None, str] | None:
-    selected: tuple[set[int] | None, str] | None = None
-    for event_time, pcs, name in events:
-        if event_time <= time + 1e-9:
-            selected = (pcs, name)
+    low = 0
+    high = len(events)
+    target = time + 1e-9
+    while low < high:
+        middle = (low + high) // 2
+        if events[middle][0] <= target:
+            low = middle + 1
         else:
-            break
-    return selected
+            high = middle
+    if low == 0:
+        return None
+    _, pcs, name = events[low - 1]
+    return pcs, name
 
 
 def score_arrangement(
