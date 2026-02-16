@@ -512,6 +512,7 @@ class ValidateBvMusicTest(unittest.TestCase):
             "7b9": {0, 1, 4, 7, 10},
             "7sus2": {0, 2, 7, 10},
             "7sus4": {0, 5, 7, 10},
+            "5": {0, 7},
         }
         self.assertEqual(set(expected), set(validate_bv_music.CHORD_QUALITY_INTERVALS))
 
