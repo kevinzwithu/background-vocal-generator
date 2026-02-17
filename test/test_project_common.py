@@ -63,6 +63,25 @@ class ProjectCommonTest(unittest.TestCase):
         self.assertEqual(selected.start, 3000)
         self.assertLessEqual(segments.lookups, 20)
 
+    def test_snap_to_music_grid_accepts_straight_and_triplet_positions(self) -> None:
+        bar_length = 4.0
+        numerator = 4
+        tolerance = 0.01
+
+        for offset in (0.125, 1 / 3, 1 / 6, 2 + 1 / 3):
+            with self.subTest(offset=offset):
+                ok, nearest = project_common.snap_to_music_grid(
+                    offset,
+                    bar_length,
+                    numerator,
+                    tolerance,
+                )
+                self.assertTrue(ok)
+                self.assertAlmostEqual(nearest, offset, places=6)
+
+        ok, _ = project_common.snap_to_music_grid(0.2, bar_length, numerator, tolerance)
+        self.assertFalse(ok)
+
 
 if __name__ == "__main__":
     unittest.main()

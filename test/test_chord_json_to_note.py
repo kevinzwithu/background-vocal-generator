@@ -42,7 +42,7 @@ def payload(
             "startTime": 0,
             "duration": duration,
             "timeUnit": "beats",
-            "grid": "1/16_bar",
+            "grid": "1/32_bar",
             "tempoMap": tempo_map or [{"time": 0, "bpm": 120}],
             "timeSignatureMap": time_signature_map
             or [

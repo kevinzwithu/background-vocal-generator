@@ -36,7 +36,7 @@ def header() -> dict[str, Any]:
         "startTime": 0,
         "duration": 2,
         "timeUnit": "beats",
-        "grid": "1/16_bar",
+        "grid": "1/32_bar",
         "tempoMap": [{"time": 0, "bpm": 120}],
         "timeSignatureMap": [{"time": 0, "numerator": 4, "denominator": 4}],
     }
@@ -47,7 +47,7 @@ def variable_time_signature_header() -> dict[str, Any]:
         "startTime": 0,
         "duration": 14,
         "timeUnit": "beats",
-        "grid": "1/16_bar",
+        "grid": "1/32_bar",
         "tempoMap": [{"time": 0, "bpm": 120}],
         "timeSignatureMap": [
             {"time": 0, "numerator": 3, "denominator": 4},

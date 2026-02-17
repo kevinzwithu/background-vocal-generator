@@ -247,14 +247,14 @@ def resolve_header(payload: dict[str, Any], bv_path: Path) -> dict[str, Any]:
     header.setdefault("startTime", 0)
     header.setdefault("duration", 0)
     header.setdefault("timeUnit", "beats")
-    header.setdefault("grid", "1/16_bar")
+    header.setdefault("grid", project_common.GRID_LABEL)
     header.setdefault("tempoMap", [{"time": 0, "bpm": 120}])
     header.setdefault("timeSignatureMap", [{"time": 0, "numerator": 4, "denominator": 4}])
 
     if header["timeUnit"] != "beats":
         raise BvMidiError("header.timeUnit must be 'beats'.")
-    if header["grid"] != "1/16_bar":
-        raise BvMidiError("header.grid must be '1/16_bar'.")
+    if header["grid"] != project_common.GRID_LABEL:
+        raise BvMidiError(f"header.grid must be '{project_common.GRID_LABEL}'.")
 
     start_time = require_number(header, "startTime", "header")
     duration = require_number(header, "duration", "header")
@@ -350,7 +350,7 @@ def build_time_signature_segments(header: dict[str, Any]) -> list[TimeSignatureS
                 numerator=numerator,
                 denominator=denominator,
                 bar_length=bar_length,
-                grid_size=bar_length / 16,
+                grid_size=project_common.straight_grid_size_beats(bar_length),
             )
         )
     return segments
@@ -367,9 +367,13 @@ def quantized(
 ) -> tuple[bool, float, TimeSignatureSegment]:
     segment = segment_for_time(segments, time)
     offset = time - segment.start
-    nearest_index = round(offset / segment.grid_size)
-    nearest = segment.start + nearest_index * segment.grid_size
-    return abs(time - nearest) <= tolerance, nearest, segment
+    ok, nearest_offset = project_common.snap_to_music_grid(
+        offset,
+        segment.bar_length,
+        segment.numerator,
+        tolerance,
+    )
+    return ok, segment.start + nearest_offset, segment
 
 
 def validate_piece_limits(header: dict[str, Any], segments: list[TimeSignatureSegment]) -> None:

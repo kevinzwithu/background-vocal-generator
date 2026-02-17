@@ -138,7 +138,7 @@ class MidiToJsonTest(unittest.TestCase):
                 "startTime": 0,
                 "duration": 2,
                 "timeUnit": "beats",
-                "grid": "1/16_bar",
+                "grid": "1/32_bar",
                 "tempoMap": [{"time": 0, "bpm": 100}],
                 "timeSignatureMap": [{"time": 0, "numerator": 4, "denominator": 4}],
             },
@@ -147,15 +147,15 @@ class MidiToJsonTest(unittest.TestCase):
             canonical["melody"],
             [
                 {"name": "C4", "midi": 60, "time": 0, "duration": 1, "bar": 1, "beat": 1, "grid": 0},
-                {"name": "D4", "midi": 62, "time": 1, "duration": 1, "bar": 1, "beat": 2, "grid": 4},
+                {"name": "D4", "midi": 62, "time": 1, "duration": 1, "bar": 1, "beat": 2, "grid": 8},
             ],
         )
         self.assertEqual(
             canonical["chord"],
             [
-                {"name": "C3", "midi": 48, "time": 1, "duration": 1, "bar": 1, "beat": 2, "grid": 4},
-                {"name": "E3", "midi": 52, "time": 1, "duration": 1, "bar": 1, "beat": 2, "grid": 4},
-                {"name": "G3", "midi": 55, "time": 1, "duration": 1, "bar": 1, "beat": 2, "grid": 4},
+                {"name": "C3", "midi": 48, "time": 1, "duration": 1, "bar": 1, "beat": 2, "grid": 8},
+                {"name": "E3", "midi": 52, "time": 1, "duration": 1, "bar": 1, "beat": 2, "grid": 8},
+                {"name": "G3", "midi": 55, "time": 1, "duration": 1, "bar": 1, "beat": 2, "grid": 8},
             ],
         )
         self.assertEqual(
@@ -307,7 +307,7 @@ class MidiToJsonTest(unittest.TestCase):
                     "duration": 1,
                     "bar": 1,
                     "beat": 3,
-                    "grid": 8,
+                    "grid": 16,
                 },
                 {
                     "section": "no_bv",
@@ -317,7 +317,7 @@ class MidiToJsonTest(unittest.TestCase):
                     "duration": 1,
                     "bar": 1,
                     "beat": 4,
-                    "grid": 12,
+                    "grid": 24,
                 },
             ],
         )
@@ -371,7 +371,7 @@ class MidiToJsonTest(unittest.TestCase):
                     "duration": 1,
                     "bar": 1,
                     "beat": 3,
-                    "grid": 8,
+                    "grid": 16,
                 },
                 {
                     "section": "no_bv",
@@ -381,7 +381,7 @@ class MidiToJsonTest(unittest.TestCase):
                     "duration": 1,
                     "bar": 1,
                     "beat": 4,
-                    "grid": 12,
+                    "grid": 24,
                 },
             ],
         )
@@ -557,8 +557,8 @@ class MidiToJsonTest(unittest.TestCase):
         self.assertEqual(
             canonical["chord"],
             [
-                {"name": "C3", "midi": 48, "time": 2, "duration": 1, "bar": 1, "beat": 3, "grid": 8},
-                {"name": "E3", "midi": 52, "time": 2, "duration": 1, "bar": 1, "beat": 3, "grid": 8},
+                {"name": "C3", "midi": 48, "time": 2, "duration": 1, "bar": 1, "beat": 3, "grid": 16},
+                {"name": "E3", "midi": 52, "time": 2, "duration": 1, "bar": 1, "beat": 3, "grid": 16},
             ],
         )
         self.assertEqual(
@@ -1100,6 +1100,64 @@ class MidiToJsonTest(unittest.TestCase):
             self.assertNotEqual(canonical_path.read_text(encoding="utf-8"), "existing")
             self.assertIn("Wrote JSON files", stdout.getvalue())
             self.assertEqual(stderr.getvalue(), "")
+
+    def test_accepts_triplet_quantized_melody_notes(self) -> None:
+        triplet_eighth_ticks = TICKS_PER_BEAT // 3
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [
+                        (0, triplet_eighth_ticks, 60),
+                        (triplet_eighth_ticks, triplet_eighth_ticks * 2, 62),
+                        (triplet_eighth_ticks * 2, TICKS_PER_BEAT, 64),
+                    ],
+                ),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT, 48),
+                        (0, TICKS_PER_BEAT, 52),
+                    ],
+                ),
+            ]
+        )
+
+        canonical, _, stderr = self.convert(midi_bytes)
+
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            canonical["melody"],
+            [
+                {
+                    "name": "C4",
+                    "midi": 60,
+                    "time": 0,
+                    "duration": 0.333333,
+                    "bar": 1,
+                    "beat": 1,
+                    "grid": 0,
+                },
+                {
+                    "name": "D4",
+                    "midi": 62,
+                    "time": 0.333333,
+                    "duration": 0.333333,
+                    "bar": 1,
+                    "beat": 1.333333,
+                    "grid": 3,
+                },
+                {
+                    "name": "E4",
+                    "midi": 64,
+                    "time": 0.666667,
+                    "duration": 0.333333,
+                    "bar": 1,
+                    "beat": 1.666667,
+                    "grid": 5,
+                },
+            ],
+        )
 
 
 if __name__ == "__main__":

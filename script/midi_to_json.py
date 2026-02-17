@@ -135,12 +135,6 @@ def midi_name(midi: int) -> str:
 normalize_number = project_common.normalize_number
 
 
-def close_enough_to_grid(value: float, grid_size: float, tolerance: float) -> tuple[bool, float]:
-    nearest_index = round(value / grid_size)
-    nearest = nearest_index * grid_size
-    return abs(value - nearest) <= tolerance, nearest
-
-
 def quarter_bpm_from_microseconds(microseconds_per_quarter: int) -> int | float:
     bpm = 60_000_000 / microseconds_per_quarter
     quarter_bpm = round(bpm * 4) / 4
@@ -416,7 +410,7 @@ def build_time_signature_segments(
         numerator = int(item["numerator"])
         denominator = int(item["denominator"])
         bar_length = numerator * 4 / denominator
-        grid_size = bar_length / 16
+        grid_size = project_common.straight_grid_size_beats(bar_length)
 
         if index > 0:
             previous = segments[-1]
@@ -455,7 +449,12 @@ def quantization_details(
 ) -> tuple[bool, TimeSignatureSegment, float]:
     segment = segment_for_time(segments, time)
     offset = time - segment.start
-    ok, nearest_offset = close_enough_to_grid(offset, segment.grid_size, tolerance)
+    ok, nearest_offset = project_common.snap_to_music_grid(
+        offset,
+        segment.bar_length,
+        segment.numerator,
+        tolerance,
+    )
     return ok, segment, segment.start + nearest_offset
 
 
@@ -467,8 +466,8 @@ def bar_position(segments: list[TimeSignatureSegment], time: float) -> tuple[int
     offset_in_bar = max(0.0, time - bar_start)
     beat = 1 + offset_in_bar
     grid = round(offset_in_bar / segment.grid_size)
-    if grid >= 16:
-        grid = 15
+    if grid >= project_common.STRAIGHT_GRID_DIVISIONS_PER_BAR:
+        grid = project_common.STRAIGHT_GRID_DIVISIONS_PER_BAR - 1
     return segment.start_bar + bar_offset, normalize_number(beat), grid
 
 
@@ -771,7 +770,7 @@ def build_header(
         "startTime": 0,
         "duration": normalize_number(duration),
         "timeUnit": "beats",
-        "grid": "1/16_bar",
+        "grid": project_common.GRID_LABEL,
         "tempoMap": tempo_map,
         "timeSignatureMap": time_signature_map,
     }

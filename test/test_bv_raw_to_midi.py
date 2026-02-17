@@ -63,7 +63,7 @@ def header() -> dict[str, Any]:
         "startTime": 0,
         "duration": 4,
         "timeUnit": "beats",
-        "grid": "1/16_bar",
+        "grid": "1/32_bar",
         "tempoMap": [{"time": 0, "bpm": 120}, {"time": 2, "bpm": 96}],
         "timeSignatureMap": [{"time": 0, "numerator": 4, "denominator": 4}],
     }

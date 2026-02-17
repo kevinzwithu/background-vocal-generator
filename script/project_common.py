@@ -13,6 +13,9 @@ MAX_TIME_SIGNATURE_EVENTS = 1_000
 MAX_TIME_SIGNATURE_BYTE = 0xFF
 MAX_TOLERANCE = 0.05
 EPSILON = 1e-9
+STRAIGHT_GRID_DIVISIONS_PER_BAR = 32
+GRID_LABEL = "1/32_bar"
+TRIPLET_SUBDIVISIONS_PER_BEAT = 6
 
 
 class TimelineSegment(Protocol):
@@ -21,6 +24,38 @@ class TimelineSegment(Protocol):
 
 
 Segment = TypeVar("Segment", bound=TimelineSegment)
+
+
+def straight_grid_size_beats(bar_length: float) -> float:
+    return bar_length / STRAIGHT_GRID_DIVISIONS_PER_BAR
+
+
+def triplet_grid_size_beats(bar_length: float, numerator: int) -> float:
+    return bar_length / (numerator * TRIPLET_SUBDIVISIONS_PER_BEAT)
+
+
+def snap_to_music_grid(
+    offset: float,
+    bar_length: float,
+    numerator: int,
+    tolerance: float,
+) -> tuple[bool, float]:
+    best_nearest = offset
+    best_distance = float("inf")
+    matched = False
+    for grid_size in (
+        straight_grid_size_beats(bar_length),
+        triplet_grid_size_beats(bar_length, numerator),
+    ):
+        nearest_index = round(offset / grid_size)
+        nearest = nearest_index * grid_size
+        distance = abs(offset - nearest)
+        if distance < best_distance:
+            best_distance = distance
+            best_nearest = nearest
+        if distance <= tolerance:
+            matched = True
+    return matched, best_nearest
 
 
 def normalize_number(value: float, digits: int = 6) -> int | float:
