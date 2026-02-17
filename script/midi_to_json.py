@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import tempfile
 from collections import deque
@@ -17,17 +18,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    import project_common
+except ModuleNotFoundError:
+    from script import project_common
+
 
 C0_MIDI = 12
 C6_MIDI = 84
-MAX_BARS = 250
-MAX_SECONDS = 10 * 60
+MAX_BARS = project_common.MAX_BARS
+MAX_SECONDS = project_common.MAX_SECONDS
 MAX_MIDI_FILE_BYTES = 100 * 1024
 MAX_TRACKS = 64
 MAX_MIDI_EVENTS = 200_000
 MAX_PARSED_NOTES = 50_000
-MAX_TEMPO_EVENTS = 2_000
-MAX_TIME_SIGNATURE_EVENTS = 1_000
+MAX_TEMPO_EVENTS = project_common.MAX_TEMPO_EVENTS
+MAX_TIME_SIGNATURE_EVENTS = project_common.MAX_TIME_SIGNATURE_EVENTS
+MAX_TOLERANCE = project_common.MAX_TOLERANCE
 OUTPUT_JSON_FILENAMES = ("canonical.json", "melody.json", "chord.json")
 PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 CONTROL_SECTIONS = {
@@ -125,10 +132,7 @@ def midi_name(midi: int) -> str:
     return f"{PITCH_NAMES[midi % 12]}{octave}"
 
 
-def normalize_number(value: float, digits: int = 6) -> int | float:
-    if abs(value - round(value)) < 1e-9:
-        return int(round(value))
-    return round(value, digits)
+normalize_number = project_common.normalize_number
 
 
 def close_enough_to_grid(value: float, grid_size: float, tolerance: float) -> tuple[bool, float]:
@@ -151,6 +155,13 @@ def quarter_bpm_from_microseconds(microseconds_per_quarter: int) -> int | float:
 def reject_if_over_limit(value: int, limit: int, label: str) -> None:
     if value > limit:
         raise MidiParseError(f"MIDI {label} exceeds limit of {limit}.")
+
+
+def validate_tolerance(tolerance: float) -> None:
+    if not project_common.is_valid_tolerance(tolerance):
+        raise MidiValidationError(
+            f"tolerance must be between 0 and {MAX_TOLERANCE} beats."
+        )
 
 
 def parse_track(
@@ -434,13 +445,7 @@ def build_time_signature_segments(
 
 
 def segment_for_time(segments: list[TimeSignatureSegment], time: float) -> TimeSignatureSegment:
-    selected = segments[0]
-    for segment in segments:
-        if time + 1e-9 >= segment.start:
-            selected = segment
-        else:
-            break
-    return selected
+    return project_common.segment_for_time(segments, time)
 
 
 def quantization_details(
@@ -686,30 +691,6 @@ def note_end(note: dict[str, Any]) -> float:
     return float(note["time"]) + float(note["duration"])
 
 
-def count_bars(duration: float, segments: list[TimeSignatureSegment]) -> int:
-    bar_count = 0
-    for index, segment in enumerate(segments):
-        next_start = segments[index + 1].start if index + 1 < len(segments) else duration
-        segment_end = min(duration, next_start)
-        elapsed = segment_end - segment.start
-        bar_count += math.ceil((elapsed - 1e-9) / segment.bar_length)
-        if duration <= next_start:
-            break
-    return bar_count
-
-
-def duration_seconds(duration: float, tempo_map: list[dict[str, Any]]) -> float:
-    seconds = 0.0
-    for index, item in enumerate(tempo_map):
-        start = float(item["time"])
-        if start >= duration:
-            break
-        end = float(tempo_map[index + 1]["time"]) if index + 1 < len(tempo_map) else duration
-        segment_end = min(duration, end)
-        seconds += (segment_end - start) * 60 / float(item["bpm"])
-    return seconds
-
-
 def validate_piece_limits(
     melody_notes: list[dict[str, Any]],
     chord_notes: list[dict[str, Any]],
@@ -723,26 +704,39 @@ def validate_piece_limits(
     if not chord_notes:
         raise MidiValidationError("Chord track must contain at least one valid chord.")
 
-    bar_count = count_bars(duration, segments)
+    bar_count, seconds = project_common.piece_metrics(duration, segments, tempo_map)
     if bar_count > MAX_BARS:
         raise MidiValidationError(
             f"MIDI length must not exceed {MAX_BARS} bars. Found {bar_count} bars."
         )
 
-    seconds = duration_seconds(duration, tempo_map)
     if seconds > MAX_SECONDS:
         raise MidiValidationError(
             f"MIDI length must not exceed 10 minutes. Found {round(seconds, 2)} seconds."
         )
 
-    for group in group_notes_by_start(chord_notes, tolerance):
-        chord_start = min(float(note["time"]) for note in group)
-        chord_end = max(note_end(note) for note in group)
-        for melody in melody_notes:
-            melody_start = float(melody["time"])
-            melody_end = note_end(melody)
-            if melody_start < chord_end - tolerance and melody_end > chord_start + tolerance:
-                return
+    melody_intervals = sorted(
+        (float(note["time"]), note_end(note)) for note in melody_notes
+    )
+    chord_intervals = sorted(
+        (
+            min(float(note["time"]) for note in group),
+            max(note_end(note) for note in group),
+        )
+        for group in group_notes_by_start(chord_notes, tolerance)
+    )
+    melody_index = 0
+    for chord_start, chord_end in chord_intervals:
+        while (
+            melody_index < len(melody_intervals)
+            and melody_intervals[melody_index][1] <= chord_start + tolerance
+        ):
+            melody_index += 1
+        if melody_index >= len(melody_intervals):
+            break
+        melody_start, melody_end = melody_intervals[melody_index]
+        if melody_start < chord_end - tolerance and melody_end > chord_start + tolerance:
+            return
 
     raise MidiValidationError(
         "Chord track must contain at least one valid chord whose time range overlaps a melody note."
@@ -810,17 +804,39 @@ def prepare_temp_text(path: Path, text: str) -> Path:
         raise
 
 
-def write_json_files(outputs: list[tuple[Path, dict[str, Any]]]) -> None:
+def write_json_files(
+    outputs: list[tuple[Path, dict[str, Any]]],
+    overwrite: bool = True,
+) -> None:
     serialized = [
         (path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         for path, payload in outputs
     ]
     prepared: list[tuple[Path, Path]] = []
+    linked: list[tuple[Path, int, int]] = []
     try:
         for path, text in serialized:
             prepared.append((prepare_temp_text(path, text), path))
         for temp_path, path in prepared:
-            temp_path.replace(path)
+            if overwrite:
+                temp_path.replace(path)
+            else:
+                try:
+                    os.link(temp_path, path)
+                except FileExistsError as exc:
+                    raise MidiValidationError(f"Output JSON file already exists: {path}") from exc
+                linked_stat = temp_path.stat()
+                linked.append((path, linked_stat.st_dev, linked_stat.st_ino))
+    except Exception:
+        if not overwrite:
+            for path, device, inode in linked:
+                try:
+                    current = path.lstat()
+                    if current.st_dev == device and current.st_ino == inode:
+                        remove_temp_file(path)
+                except OSError:
+                    pass
+        raise
     finally:
         for temp_path, _ in prepared:
             remove_temp_file(temp_path)
@@ -851,6 +867,7 @@ def convert_midi_to_json(
     tolerance: float,
     overwrite: bool = True,
 ) -> Path:
+    validate_tolerance(tolerance)
     output_dir = output_dir_for_midi(input_path, output_root)
     if not overwrite:
         require_no_existing_outputs(output_dir)
@@ -928,7 +945,8 @@ def convert_midi_to_json(
             (output_dir / "canonical.json", canonical),
             (output_dir / "melody.json", melody_payload),
             (output_dir / "chord.json", {"header": header, "chord": chord_notes}),
-        ]
+        ],
+        overwrite=overwrite,
     )
 
     if filtered_melody or filtered_chord:
@@ -996,7 +1014,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        output_dir = convert_midi_to_json(input_path, output_root, args.tolerance)
+        output_dir = convert_midi_to_json(
+            input_path,
+            output_root,
+            args.tolerance,
+            overwrite=bool(existing_outputs),
+        )
     except (MidiParseError, MidiValidationError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

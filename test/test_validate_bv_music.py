@@ -405,6 +405,34 @@ class ValidateBvMusicTest(unittest.TestCase):
         self.assertEqual(chord, ({0, 4, 7}, "C"))
         self.assertLessEqual(events.lookups, 20)
 
+    def test_section_lookup_is_logarithmic(self) -> None:
+        class CountingSpans(list[Any]):
+            def __init__(self, values: list[Any]) -> None:
+                super().__init__(values)
+                self.lookups = 0
+
+            def __getitem__(self, index: int) -> Any:
+                self.lookups += 1
+                return super().__getitem__(index)
+
+        spans = CountingSpans(
+            [
+                validate_bv_music.SectionSpan(float(index * 2), float(index * 2 + 1), "verse")
+                for index in range(4096)
+            ]
+        )
+
+        section = validate_bv_music.section_at(spans, 6000.5)
+
+        self.assertEqual(section, "verse")
+        self.assertLessEqual(spans.lookups, 20)
+
+    def test_rejects_invalid_min_score(self) -> None:
+        report, exit_code = validate_bv_music.validate(Path("unused"), min_score=-1)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("between 0 and 100", report["hardErrors"][0])
+
     def test_chord_events_rejects_invalid_bar_and_beat_positions(self) -> None:
         cases = [
             ("Bar 0: beat 0 C", "bar must be at least 1"),
@@ -564,6 +592,20 @@ class ValidateBvMusicTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertFalse(report["passed"])
         self.assertIn("complete and ordered", report["hardErrors"][0])
+
+    def test_hard_validation_rejects_note_end_after_header_duration(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            broken_tracks = tracks()
+            broken_tracks["VocalPad1"] = [
+                {"name": "C4", "midi": 60, "time": 1, "duration": 2}
+            ]
+            bv_path = self.write_project(root, broken_tracks)
+
+            report, exit_code = validate_bv_music.validate(bv_path, min_score=80)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("shorter than the latest BV note end", report["hardErrors"][0])
 
 
 if __name__ == "__main__":

@@ -202,6 +202,26 @@ class MidiToJsonTest(unittest.TestCase):
             with self.assertRaisesRegex(midi_to_json.MidiParseError, "0.25 BPM increments"):
                 midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
 
+    def test_rejects_tolerance_values_that_can_bypass_validation(self) -> None:
+        with self.assertRaisesRegex(midi_to_json.MidiValidationError, "tolerance must be between"):
+            midi_to_json.validate_tolerance(midi_to_json.MAX_TOLERANCE + 0.001)
+
+    def test_no_overwrite_json_write_rolls_back_on_race(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.json"
+            second = root / "second.json"
+            second.write_text("existing", encoding="utf-8")
+
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "already exists"):
+                midi_to_json.write_json_files(
+                    [(first, {"value": 1}), (second, {"value": 2})],
+                    overwrite=False,
+                )
+
+            self.assertFalse(first.exists())
+            self.assertEqual(second.read_text(encoding="utf-8"), "existing")
+
     def test_rejects_missing_or_duplicate_required_tracks(self) -> None:
         cases = [
             (

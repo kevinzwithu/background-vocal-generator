@@ -16,12 +16,16 @@ from pathlib import Path
 from typing import Any
 
 import bv_raw_to_midi
+try:
+    import project_common
+except ModuleNotFoundError:
+    from script import project_common
 
 
 EXPECTED_NOTE_KEYS = {"name", "midi", "time", "duration"}
 MAX_NOTE_TXT_FILE_BYTES = 100 * 1024
-MAX_BARS = 250
-MAX_SECONDS = 10 * 60
+MAX_BARS = project_common.MAX_BARS
+MAX_SECONDS = project_common.MAX_SECONDS
 MELODY_ALIGNED_TRACKS = ("HHA", "HHB", "HHF", "LHA", "LHB", "LHF")
 CONTOUR_TRACKS = ("HHA", "HHB", "LHA", "LHB")
 HIGH_TRACKS = ("HHA", "HHB", "HHF")
@@ -94,6 +98,13 @@ class TimeSignatureSegment:
     start_bar: int
 
 
+@dataclass(frozen=True)
+class SectionSpan:
+    start: float
+    end: float
+    section: str
+
+
 def midi_name(midi: int) -> str:
     return f"{PITCH_NAMES[midi % 12]}{midi // 12 - 1}"
 
@@ -146,7 +157,9 @@ def hard_validate(bv_path: Path) -> tuple[dict[str, Any] | None, list[str]]:
         header = bv_raw_to_midi.resolve_header(payload, bv_path)
         tracks = bv_raw_to_midi.load_tracks(payload)
         segments = bv_raw_to_midi.build_time_signature_segments(header)
-        bv_raw_to_midi.validate_notes(tracks, segments, 0.01)
+        bv_raw_to_midi.validate_piece_limits(header, segments)
+        max_note_end = bv_raw_to_midi.validate_notes(tracks, segments, 0.01)
+        bv_raw_to_midi.validate_header_bounds(header, max_note_end)
         bv_raw_to_midi.validate_melody_aligned_harmonies(
             tracks,
             bv_raw_to_midi.sibling_melody(bv_path),
@@ -178,18 +191,42 @@ def hard_validate(bv_path: Path) -> tuple[dict[str, Any] | None, list[str]]:
     return {"header": header, "tracks": tracks}, errors
 
 
-def control_spans(source: dict[str, Any]) -> list[dict[str, Any]]:
+def control_spans(source: dict[str, Any]) -> list[SectionSpan]:
     control = source.get("control")
-    return control if isinstance(control, list) else []
+    if not isinstance(control, list):
+        return []
+    spans: list[SectionSpan] = []
+    for index, item in enumerate(control):
+        if not isinstance(item, dict):
+            raise ValueError(f"Source control item at index {index} must be an object.")
+        label = f"Source control item at index {index}"
+        start = bv_raw_to_midi.require_number(item, "time", label)
+        duration = bv_raw_to_midi.require_number(item, "duration", label)
+        if start < 0 or duration <= 0:
+            raise ValueError(f"{label} must have non-negative time and positive duration.")
+        spans.append(
+            SectionSpan(start, start + duration, str(item.get("section", "default")))
+        )
+    spans.sort(key=lambda span: (span.start, span.end, span.section))
+    for previous, current in zip(spans, spans[1:]):
+        if current.start < previous.end:
+            raise ValueError("Source control spans must not overlap.")
+    return spans
 
 
-def section_at(control: list[dict[str, Any]], time: float) -> str:
-    for item in control:
-        start = float(item["time"])
-        end = start + float(item["duration"])
-        if start <= time < end:
-            return str(item.get("section", "default"))
-    return "default"
+def section_at(control: list[SectionSpan], time: float) -> str:
+    low = 0
+    high = len(control)
+    while low < high:
+        middle = (low + high) // 2
+        if control[middle].start <= time:
+            low = middle + 1
+        else:
+            high = middle
+    if low == 0:
+        return "default"
+    span = control[low - 1]
+    return span.section if time < span.end else "default"
 
 
 def build_time_signature_segments(header: dict[str, Any]) -> list[TimeSignatureSegment]:
@@ -227,13 +264,7 @@ def segment_for_time(
     segments: list[TimeSignatureSegment],
     time: float,
 ) -> TimeSignatureSegment:
-    selected = segments[0]
-    for segment in segments:
-        if time + 1e-9 >= segment.start:
-            selected = segment
-        else:
-            break
-    return selected
+    return project_common.segment_for_time(segments, time)
 
 
 def segment_for_bar(
@@ -283,21 +314,7 @@ def expected_bar_count(header: dict[str, Any], segments: list[TimeSignatureSegme
     duration = float(header["duration"])
     if duration <= 0:
         return 0
-    return bar_key(max(0.0, duration - 1e-9), segments)
-
-
-def duration_seconds(header: dict[str, Any]) -> float:
-    duration = float(header["duration"])
-    seconds = 0.0
-    tempo_map = header["tempoMap"]
-    for index, item in enumerate(tempo_map):
-        start = float(item["time"])
-        if start >= duration:
-            break
-        end = float(tempo_map[index + 1]["time"]) if index + 1 < len(tempo_map) else duration
-        segment_end = min(duration, end)
-        seconds += (segment_end - start) * 60 / float(item["bpm"])
-    return seconds
+    return project_common.count_bars(duration, segments)
 
 
 def read_note_text(note_txt: Path) -> str:
@@ -354,10 +371,14 @@ def validate_markers(
 def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, set[int] | None, str]]:
     events: list[tuple[float, set[int] | None, str]] = []
     segments = build_time_signature_segments(header)
-    bar_count = expected_bar_count(header, segments)
+    duration = float(header["duration"])
+    bar_count, seconds = project_common.piece_metrics(
+        duration,
+        segments,
+        header["tempoMap"],
+    )
     if bar_count > MAX_BARS:
         raise ValueError(f"Arrangement length must not exceed {MAX_BARS} bars. Found {bar_count} bars.")
-    seconds = duration_seconds(header)
     if seconds > MAX_SECONDS:
         raise ValueError(
             f"Arrangement length must not exceed 10 minutes. Found {round(seconds, 2)} seconds."
@@ -564,6 +585,15 @@ def score_arrangement(
 
 
 def validate(path: Path, min_score: int) -> tuple[dict[str, Any], int]:
+    if isinstance(min_score, bool) or not isinstance(min_score, int) or not 0 <= min_score <= 100:
+        return {
+            "passed": False,
+            "score": 0,
+            "minScore": min_score,
+            "hardErrors": ["min_score must be an integer between 0 and 100."],
+            "warnings": [],
+            "suggestions": ["Use a valid minimum score and rerun validation."],
+        }, 1
     bv_path = resolve_bv_path(path)
     payload, hard_errors = hard_validate(bv_path)
     if payload is None:

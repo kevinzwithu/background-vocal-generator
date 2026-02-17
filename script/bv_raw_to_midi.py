@@ -6,27 +6,34 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    import project_common
+except ModuleNotFoundError:
+    from script import project_common
+
 
 DEFAULT_TICKS_PER_BEAT = 480
 MAX_JSON_FILE_BYTES = 5 * 1024 * 1024
-MAX_BARS = 250
-MAX_SECONDS = 10 * 60
+MAX_BARS = project_common.MAX_BARS
+MAX_SECONDS = project_common.MAX_SECONDS
 MAX_NOTES_PER_TRACK = 50_000
 MAX_TOTAL_NOTES = 200_000
 MAX_SOURCE_MELODY_NOTES = 50_000
 MAX_CONTROL_EVENTS = 50_000
-MAX_TEMPO_EVENTS = 2_000
-MAX_TIME_SIGNATURE_EVENTS = 1_000
+MAX_TEMPO_EVENTS = project_common.MAX_TEMPO_EVENTS
+MAX_TIME_SIGNATURE_EVENTS = project_common.MAX_TIME_SIGNATURE_EVENTS
 MAX_MIDI_VLQ = 0x0FFFFFFF
 MAX_TICKS_PER_BEAT = 0x7FFF
 MAX_TEMPO_MICROSECONDS = 0xFFFFFF
-MAX_TIME_SIGNATURE_BYTE = 0xFF
+MAX_TIME_SIGNATURE_BYTE = project_common.MAX_TIME_SIGNATURE_BYTE
+MAX_TOLERANCE = project_common.MAX_TOLERANCE
 C0_MIDI = 12
 C6_MIDI = 84
 EXPECTED_TRACKS = (
@@ -68,7 +75,7 @@ def remove_temp_file(path: Path) -> None:
         pass
 
 
-def write_bytes_atomically(path: Path, payload: bytes) -> None:
+def write_bytes_atomically(path: Path, payload: bytes, overwrite: bool = True) -> None:
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -79,16 +86,19 @@ def write_bytes_atomically(path: Path, payload: bytes) -> None:
         ) as temp_file:
             temp_path = Path(temp_file.name)
             temp_file.write(payload)
-        temp_path.replace(path)
+        if overwrite:
+            temp_path.replace(path)
+        else:
+            try:
+                os.link(temp_path, path)
+            except FileExistsError as exc:
+                raise BvMidiError(f"Output MIDI file already exists: {path}") from exc
     finally:
         if temp_path is not None:
             remove_temp_file(temp_path)
 
 
-def normalize_number(value: float, digits: int = 6) -> int | float:
-    if abs(value - round(value)) < 1e-9:
-        return int(round(value))
-    return round(value, digits)
+normalize_number = project_common.normalize_number
 
 
 def require_number(item: dict[str, Any], key: str, label: str) -> float:
@@ -153,10 +163,8 @@ def validate_export_options(ticks_per_beat: int, velocity: int, tolerance: float
         raise BvMidiError("velocity must be an integer.")
     if not 1 <= velocity <= 127:
         raise BvMidiError("velocity must be between 1 and 127.")
-    if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool):
-        raise BvMidiError("tolerance must be a finite non-negative number.")
-    if not math.isfinite(float(tolerance)) or tolerance < 0:
-        raise BvMidiError("tolerance must be a finite non-negative number.")
+    if not project_common.is_valid_tolerance(tolerance):
+        raise BvMidiError(f"tolerance must be between 0 and {MAX_TOLERANCE} beats.")
 
 
 def reject_if_over_limit(value: int, limit: int, label: str) -> None:
@@ -273,8 +281,8 @@ def validate_tempo_map(tempo_map: Any) -> None:
         require_quarter_bpm(item, "bpm", label)
         if time < 0:
             raise BvMidiError("tempoMap time cannot be negative.")
-        if time < previous_time:
-            raise BvMidiError("tempoMap must be sorted by time.")
+        if time <= previous_time:
+            raise BvMidiError("tempoMap times must be strictly increasing.")
         previous_time = time
     if abs(require_number(tempo_map[0], "time", "tempoMap[0]")) > 1e-9:
         raise BvMidiError("tempoMap must start at time 0.")
@@ -298,8 +306,8 @@ def validate_time_signature_map(time_signature_map: Any) -> None:
         denominator = require_int(item, "denominator", label)
         if time < 0:
             raise BvMidiError("timeSignatureMap time cannot be negative.")
-        if time < previous_time:
-            raise BvMidiError("timeSignatureMap must be sorted by time.")
+        if time <= previous_time:
+            raise BvMidiError("timeSignatureMap times must be strictly increasing.")
         if numerator <= 0:
             raise BvMidiError("timeSignatureMap numerator must be positive.")
         if numerator > MAX_TIME_SIGNATURE_BYTE:
@@ -349,13 +357,7 @@ def build_time_signature_segments(header: dict[str, Any]) -> list[TimeSignatureS
 
 
 def segment_for_time(segments: list[TimeSignatureSegment], time: float) -> TimeSignatureSegment:
-    selected = segments[0]
-    for segment in segments:
-        if time + 1e-9 >= segment.start:
-            selected = segment
-        else:
-            break
-    return selected
+    return project_common.segment_for_time(segments, time)
 
 
 def quantized(
@@ -370,38 +372,17 @@ def quantized(
     return abs(time - nearest) <= tolerance, nearest, segment
 
 
-def count_bars(duration: float, segments: list[TimeSignatureSegment]) -> int:
-    bar_count = 0
-    for index, segment in enumerate(segments):
-        next_start = segments[index + 1].start if index + 1 < len(segments) else duration
-        segment_end = min(duration, next_start)
-        elapsed = segment_end - segment.start
-        bar_count += math.ceil((elapsed - 1e-9) / segment.bar_length)
-        if duration <= next_start:
-            break
-    return bar_count
-
-
-def duration_seconds(duration: float, tempo_map: list[dict[str, Any]]) -> float:
-    seconds = 0.0
-    for index, item in enumerate(tempo_map):
-        start = float(item["time"])
-        if start >= duration:
-            break
-        end = float(tempo_map[index + 1]["time"]) if index + 1 < len(tempo_map) else duration
-        segment_end = min(duration, end)
-        seconds += (segment_end - start) * 60 / float(item["bpm"])
-    return seconds
-
-
 def validate_piece_limits(header: dict[str, Any], segments: list[TimeSignatureSegment]) -> None:
     duration = float(header["duration"])
-    bar_count = count_bars(duration, segments)
+    bar_count, seconds = project_common.piece_metrics(
+        duration,
+        segments,
+        header["tempoMap"],
+    )
     if bar_count > MAX_BARS:
         raise BvMidiError(
             f"Arrangement length must not exceed {MAX_BARS} bars. Found {bar_count} bars."
         )
-    seconds = duration_seconds(duration, header["tempoMap"])
     if seconds > MAX_SECONDS:
         raise BvMidiError(
             f"Arrangement length must not exceed 10 minutes. Found {round(seconds, 2)} seconds."
@@ -498,18 +479,41 @@ def validate_melody_aligned_harmonies(
     if melody is None:
         return
 
-    no_bv_spans = [
-        (float(item["time"]), float(item["time"]) + float(item["duration"]))
-        for item in control or []
-        if isinstance(item, dict) and item.get("section") == "no_bv"
-    ]
+    raw_no_bv_spans: list[tuple[float, float]] = []
+    for index, item in enumerate(control or []):
+        if not isinstance(item, dict):
+            raise BvMidiError(f"Source control item at index {index} must be an object.")
+        if item.get("section") != "no_bv":
+            continue
+        label = f"Source control item at index {index}"
+        start = require_number(item, "time", label)
+        duration = require_number(item, "duration", label)
+        if start < 0 or duration <= 0:
+            raise BvMidiError(f"{label} must have non-negative time and positive duration.")
+        raw_no_bv_spans.append((start, start + duration))
+
+    no_bv_spans: list[tuple[float, float]] = []
+    for start, end in sorted(raw_no_bv_spans):
+        if no_bv_spans and start <= no_bv_spans[-1][1] + tolerance:
+            previous_start, previous_end = no_bv_spans[-1]
+            no_bv_spans[-1] = (previous_start, max(previous_end, end))
+        else:
+            no_bv_spans.append((start, end))
 
     def requires_harmony(note: dict[str, Any]) -> bool:
         start = float(note["time"])
-        return not any(
-            span_start - tolerance <= start < span_end - tolerance
-            for span_start, span_end in no_bv_spans
-        )
+        low = 0
+        high = len(no_bv_spans)
+        while low < high:
+            middle = (low + high) // 2
+            if no_bv_spans[middle][0] - tolerance <= start:
+                low = middle + 1
+            else:
+                high = middle
+        if low == 0:
+            return True
+        span_start, span_end = no_bv_spans[low - 1]
+        return not (span_start - tolerance <= start < span_end - tolerance)
 
     for index, melody_note in enumerate(melody):
         if not isinstance(melody_note, dict):
@@ -673,6 +677,27 @@ def write_midi(
     if path.exists() and not overwrite:
         raise BvMidiError(f"Output MIDI file already exists: {path}")
 
+    header_duration = validate_header_bounds(header, max_note_end)
+    end_tick = beats_to_ticks(header_duration, ticks_per_beat)
+
+    chunks = [conductor_track(header, ticks_per_beat, end_tick)]
+    for track_name in EXPECTED_TRACKS:
+        chunks.append(
+            note_track(track_name, tracks[track_name], ticks_per_beat, end_tick, velocity)
+        )
+
+    midi_header_payload = (
+        (1).to_bytes(2, "big")
+        + len(chunks).to_bytes(2, "big")
+        + ticks_per_beat.to_bytes(2, "big")
+    )
+    midi_header = b"MThd" + len(midi_header_payload).to_bytes(4, "big") + midi_header_payload
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_bytes_atomically(path, midi_header + b"".join(chunks), overwrite)
+
+
+def validate_header_bounds(header: dict[str, Any], max_note_end: float) -> float:
     header_duration = float(header.get("duration", 0) or 0)
     if max_note_end > header_duration + 1e-9:
         raise BvMidiError(
@@ -688,21 +713,7 @@ def write_midi(
             f"header.duration={normalize_number(header_duration)} is shorter than "
             f"the latest tempo or time signature event={normalize_number(latest_header_event)}."
         )
-    end_tick = beats_to_ticks(header_duration, ticks_per_beat)
-
-    chunks = [conductor_track(header, ticks_per_beat, end_tick)]
-    for track_name in EXPECTED_TRACKS:
-        chunks.append(note_track(track_name, tracks[track_name], ticks_per_beat, end_tick, velocity))
-
-    midi_header_payload = (
-        (1).to_bytes(2, "big")
-        + len(chunks).to_bytes(2, "big")
-        + ticks_per_beat.to_bytes(2, "big")
-    )
-    midi_header = b"MThd" + len(midi_header_payload).to_bytes(4, "big") + midi_header_payload
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_bytes_atomically(path, midi_header + b"".join(chunks))
+    return header_duration
 
 
 def convert_bv_raw_to_midi(
@@ -802,7 +813,7 @@ def main(argv: list[str] | None = None) -> int:
             args.ticks_per_beat,
             args.velocity,
             args.tolerance,
-            overwrite=True,
+            overwrite=destination_exists,
         )
     except (BvMidiError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

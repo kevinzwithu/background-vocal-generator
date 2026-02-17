@@ -309,6 +309,27 @@ class BvRawToMidiTest(unittest.TestCase):
 
             self.assertTrue(output_path.exists())
 
+    def test_rejects_tolerance_values_that_can_bypass_validation(self) -> None:
+        with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "tolerance must be between"):
+            bv_raw_to_midi.validate_export_options(
+                480,
+                80,
+                bv_raw_to_midi.MAX_TOLERANCE + 0.001,
+            )
+
+    def test_atomic_no_overwrite_preserves_racing_output(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "output.mid"
+            path.write_bytes(b"existing")
+
+            with (
+                patch.object(Path, "exists", return_value=False),
+                self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "already exists"),
+            ):
+                bv_raw_to_midi.write_bytes_atomically(path, b"new", overwrite=False)
+
+            self.assertEqual(path.read_bytes(), b"existing")
+
     def test_rejects_bpm_values_finer_than_quarter(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

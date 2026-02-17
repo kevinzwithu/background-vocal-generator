@@ -56,6 +56,9 @@ def payload(
 
 class ChordJsonToNoteTest(unittest.TestCase):
     def convert(self, source: dict[str, Any]) -> tuple[str, Any]:
+        existing = getattr(self, "temp_dir", None)
+        if existing is not None:
+            existing.cleanup()
         self.temp_dir = TemporaryDirectory()
         root = Path(self.temp_dir.name)
         chord_path = root / "chord.json"
@@ -177,6 +180,32 @@ class ChordJsonToNoteTest(unittest.TestCase):
 
         with self.assertRaisesRegex(chord_json_to_note.ChordChartError, "must be 'beats'"):
             self.convert(source)
+
+    def test_rejects_header_event_count_and_time_signature_size_limits(self) -> None:
+        source = payload([note(60, 0), note(64, 0), note(67, 0)])
+        with unittest.mock.patch.object(chord_json_to_note, "MAX_TEMPO_EVENTS", 0):
+            with self.assertRaisesRegex(chord_json_to_note.ChordChartError, "Tempo event count"):
+                self.convert(source)
+
+        source = payload(
+            [note(60, 0), note(64, 0), note(67, 0)],
+            time_signature_map=[{"time": 0, "numerator": 256, "denominator": 4}],
+        )
+        with self.assertRaisesRegex(chord_json_to_note.ChordChartError, "numerator must be at most"):
+            self.convert(source)
+
+    def test_atomic_no_overwrite_preserves_racing_output(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "note.txt"
+            path.write_text("existing", encoding="utf-8")
+
+            with (
+                unittest.mock.patch.object(Path, "exists", return_value=False),
+                self.assertRaisesRegex(chord_json_to_note.ChordChartError, "already exists"),
+            ):
+                chord_json_to_note.write_text_atomically(path, "new", overwrite=False)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "existing")
 
 
 if __name__ == "__main__":

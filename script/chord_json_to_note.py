@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import tempfile
 from collections import defaultdict
@@ -13,13 +14,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    import project_common
+except ModuleNotFoundError:
+    from script import project_common
+
 
 MAX_JSON_FILE_BYTES = 5 * 1024 * 1024
 MAX_NOTE_TXT_FILE_BYTES = 100 * 1024
-MAX_BARS = 250
-MAX_SECONDS = 10 * 60
+MAX_BARS = project_common.MAX_BARS
+MAX_SECONDS = project_common.MAX_SECONDS
 MAX_CHORD_NOTES = 50_000
-EPSILON = 1e-9
+MAX_TEMPO_EVENTS = project_common.MAX_TEMPO_EVENTS
+MAX_TIME_SIGNATURE_EVENTS = project_common.MAX_TIME_SIGNATURE_EVENTS
+MAX_TIME_SIGNATURE_BYTE = project_common.MAX_TIME_SIGNATURE_BYTE
+EPSILON = project_common.EPSILON
 FLAT_ROOT_NAMES = ("C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B")
 SHARP_ROOT_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 CHORD_TEMPLATES = (
@@ -90,10 +99,7 @@ class ConversionResult:
     warnings: tuple[str, ...]
 
 
-def normalize_number(value: float, digits: int = 6) -> int | float:
-    if abs(value - round(value)) < EPSILON:
-        return int(round(value))
-    return round(value, digits)
+normalize_number = project_common.normalize_number
 
 
 def require_number(item: dict[str, Any], key: str, label: str) -> float:
@@ -168,6 +174,8 @@ def validate_header(payload: dict[str, Any]) -> dict[str, Any]:
 def validate_tempo_map(tempo_map: Any) -> None:
     if not isinstance(tempo_map, list) or not tempo_map:
         raise ChordChartError("header.tempoMap must be a non-empty list.")
+    if len(tempo_map) > MAX_TEMPO_EVENTS:
+        raise ChordChartError(f"Tempo event count exceeds {MAX_TEMPO_EVENTS}.")
     previous_time = -1.0
     for index, item in enumerate(tempo_map):
         if not isinstance(item, dict):
@@ -186,6 +194,10 @@ def validate_tempo_map(tempo_map: Any) -> None:
 def validate_time_signature_map(time_signature_map: Any) -> None:
     if not isinstance(time_signature_map, list) or not time_signature_map:
         raise ChordChartError("header.timeSignatureMap must be a non-empty list.")
+    if len(time_signature_map) > MAX_TIME_SIGNATURE_EVENTS:
+        raise ChordChartError(
+            f"Time signature event count exceeds {MAX_TIME_SIGNATURE_EVENTS}."
+        )
     previous_time = -1.0
     for index, item in enumerate(time_signature_map):
         if not isinstance(item, dict):
@@ -200,8 +212,17 @@ def validate_time_signature_map(time_signature_map: Any) -> None:
             )
         if numerator <= 0:
             raise ChordChartError("timeSignatureMap numerator must be positive.")
+        if numerator > MAX_TIME_SIGNATURE_BYTE:
+            raise ChordChartError(
+                f"timeSignatureMap numerator must be at most {MAX_TIME_SIGNATURE_BYTE}."
+            )
         if denominator <= 0 or denominator & (denominator - 1):
             raise ChordChartError("timeSignatureMap denominator must be a power of two.")
+        if denominator.bit_length() - 1 > MAX_TIME_SIGNATURE_BYTE:
+            raise ChordChartError(
+                "timeSignatureMap denominator exponent must be at most "
+                f"{MAX_TIME_SIGNATURE_BYTE}."
+            )
         previous_time = time
     if abs(float(time_signature_map[0]["time"])) > EPSILON:
         raise ChordChartError("timeSignatureMap must start at time 0.")
@@ -232,13 +253,7 @@ def build_segments(header: dict[str, Any]) -> list[TimeSignatureSegment]:
 
 
 def segment_for_time(segments: list[TimeSignatureSegment], time: float) -> TimeSignatureSegment:
-    selected = segments[0]
-    for segment in segments:
-        if time + EPSILON >= segment.start:
-            selected = segment
-        else:
-            break
-    return selected
+    return project_common.segment_for_time(segments, time)
 
 
 def bar_and_beat(segments: list[TimeSignatureSegment], time: float) -> tuple[int, float]:
@@ -247,29 +262,6 @@ def bar_and_beat(segments: list[TimeSignatureSegment], time: float) -> tuple[int
     bar_offset = math.floor((offset + EPSILON) / segment.bar_length)
     beat = offset - bar_offset * segment.bar_length + 1
     return segment.start_bar + bar_offset, beat
-
-
-def bar_count_for_duration(segments: list[TimeSignatureSegment], duration: float) -> int:
-    bar_count = 0
-    for index, segment in enumerate(segments):
-        next_start = segments[index + 1].start if index + 1 < len(segments) else duration
-        segment_end = min(duration, next_start)
-        elapsed = max(0.0, segment_end - segment.start)
-        bar_count += math.ceil((elapsed - EPSILON) / segment.bar_length)
-        if duration <= next_start:
-            break
-    return bar_count
-
-
-def duration_seconds(duration: float, tempo_map: list[dict[str, Any]]) -> float:
-    seconds = 0.0
-    for index, item in enumerate(tempo_map):
-        start = float(item["time"])
-        end = float(tempo_map[index + 1]["time"]) if index + 1 < len(tempo_map) else duration
-        seconds += (min(duration, end) - start) * 60 / float(item["bpm"])
-        if end >= duration:
-            break
-    return seconds
 
 
 def format_number(value: float | int) -> str:
@@ -404,10 +396,13 @@ def render_chart(
     events: list[ChordEvent],
 ) -> tuple[str, int]:
     duration = float(header["duration"])
-    bar_count = bar_count_for_duration(segments, duration)
+    bar_count, seconds = project_common.piece_metrics(
+        duration,
+        segments,
+        header["tempoMap"],
+    )
     if bar_count > MAX_BARS:
         raise ChordChartError(f"Chord chart exceeds {MAX_BARS} bars. Found {bar_count}.")
-    seconds = duration_seconds(duration, header["tempoMap"])
     if seconds > MAX_SECONDS:
         raise ChordChartError(
             f"Chord chart exceeds 10 minutes. Found {round(seconds, 2)} seconds."
@@ -462,7 +457,13 @@ def write_text_atomically(path: Path, text: str, overwrite: bool) -> None:
         ) as temp_file:
             temp_path = Path(temp_file.name)
             temp_file.write(text)
-        temp_path.replace(path)
+        if overwrite:
+            temp_path.replace(path)
+        else:
+            try:
+                os.link(temp_path, path)
+            except FileExistsError as exc:
+                raise ChordChartError(f"Output note.txt already exists: {path}") from exc
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -517,10 +518,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        if destination.exists() and not args.force and not confirm_overwrite(destination):
+        destination_exists = destination.exists()
+        if destination_exists and not args.force and not confirm_overwrite(destination):
             print(f"Canceled: output note.txt already exists: {destination}", file=sys.stderr)
             return 2
-        result = convert_chord_json_to_note(chord_path, destination, overwrite=True)
+        result = convert_chord_json_to_note(
+            chord_path,
+            destination,
+            overwrite=args.force or destination_exists,
+        )
     except (ChordChartError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
