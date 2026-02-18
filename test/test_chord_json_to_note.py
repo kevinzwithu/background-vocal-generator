@@ -147,6 +147,18 @@ class ChordJsonToNoteTest(unittest.TestCase):
         self.assertEqual(len(result.warnings), 1)
         self.assertIn("alternatives: Am7", result.warnings[0])
 
+    def test_names_minor_seventh_without_fifth(self) -> None:
+        source = payload(
+            [note(39, 0), note(41, 0), note(44, 0)],
+            duration=3,
+            time_signature_map=[{"time": 0, "numerator": 4, "denominator": 4}],
+        )
+
+        text, result = self.convert(source)
+
+        self.assertIn("Bar 1: beat 1 Fm7(no5)", text)
+        self.assertEqual(result.warnings, ())
+
     def test_reports_incomplete_triad_for_agent_review(self) -> None:
         source = payload(
             [note(60, 0), note(64, 0)],

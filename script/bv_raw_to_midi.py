@@ -36,6 +36,7 @@ MAX_TIME_SIGNATURE_BYTE = project_common.MAX_TIME_SIGNATURE_BYTE
 MAX_TOLERANCE = project_common.MAX_TOLERANCE
 C0_MIDI = 12
 C6_MIDI = 84
+BV_HARMONY_MAX_MIDI = 87
 EXPECTED_TRACKS = (
     "LeadDouble",
     "HHA",
@@ -436,9 +437,11 @@ def validate_notes(
             duration = require_number(note, "duration", label)
             end = start + duration
 
-            if midi < C0_MIDI or midi > C6_MIDI:
+            max_midi = C6_MIDI if track_name == "LeadDouble" else BV_HARMONY_MAX_MIDI
+            if midi < C0_MIDI or midi > max_midi:
                 raise BvMidiError(
-                    f"Track {track_name} note {note.get('name')} midi={midi} is outside C0-C6."
+                    f"Track {track_name} note {note.get('name')} midi={midi} is outside "
+                    f"the allowed range for that track."
                 )
             if start < 0:
                 raise BvMidiError(f"Track {track_name} note {note.get('name')} has negative time.")
@@ -544,16 +547,37 @@ def validate_melody_aligned_harmonies(
                 f"Expected {len(harmony_melody)}, found {len(tracks[track_name])}."
             )
 
+    octave_shift: int | None = None
     for index, melody_note in enumerate(melody):
         lead_note = lead_double[index]
-        for key in ("name", "midi", "time", "duration"):
-            if lead_note.get(key) != melody_note.get(key):
-                raise BvMidiError(
-                    "LeadDouble must exactly copy melody. "
-                    f"Mismatch at index {index}, field '{key}'."
-                )
+        if (
+            abs(float(lead_note["time"]) - float(melody_note["time"])) > tolerance
+            or abs(float(lead_note["duration"]) - float(melody_note["duration"])) > tolerance
+        ):
+            raise BvMidiError(
+                "LeadDouble must preserve melody timing. "
+                f"Mismatch at index {index}."
+            )
+        shift = int(lead_note["midi"]) - int(melody_note["midi"])
+        if shift % 12 != 0:
+            raise BvMidiError(
+                "LeadDouble pitch changes must be a uniform whole-octave transposition. "
+                f"Found non-octave shift {shift} semitones at index {index}."
+            )
+        if octave_shift is None:
+            octave_shift = shift
+        elif shift != octave_shift:
+            raise BvMidiError(
+                "LeadDouble pitch changes must use one uniform octave shift for the entire melody. "
+                f"Expected {octave_shift} semitones, found {shift} at index {index}."
+            )
 
-    for index, melody_note in enumerate(harmony_melody):
+    harmony_lead = [
+        lead_note
+        for source_note, lead_note in zip(melody, lead_double)
+        if requires_harmony(source_note)
+    ]
+    for index, melody_note in enumerate(harmony_lead):
         melody_midi = int(melody_note["midi"])
         for track_name in MELODY_ALIGNED_TRACKS:
             harmony_note = tracks[track_name][index]

@@ -139,6 +139,29 @@ class ValidateBvMusicTest(unittest.TestCase):
         self.assertGreaterEqual(report["score"], 80)
         self.assertEqual(report["hardErrors"], [])
 
+    def test_passes_uniform_octave_transposed_lead_and_harmonies(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload_tracks = tracks()
+            for track_name in (
+                "LeadDouble",
+                "HHA",
+                "HHB",
+                "HHF",
+                "LHA",
+                "LHB",
+                "LHF",
+            ):
+                for note in payload_tracks[track_name]:
+                    note["midi"] += 12
+                    note["name"] = validate_bv_music.midi_name(note["midi"])
+            bv_path = self.write_project(Path(temp_dir), payload_tracks)
+
+            report, exit_code = validate_bv_music.validate(bv_path, min_score=80)
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["hardErrors"], [])
+
     def test_fails_hard_validation_for_extra_note_fields(self) -> None:
         with TemporaryDirectory() as temp_dir:
             payload_tracks = tracks()
@@ -527,6 +550,7 @@ class ValidateBvMusicTest(unittest.TestCase):
             "13": {0, 2, 4, 5, 7, 9, 10},
             "m6": {0, 3, 7, 9},
             "m7": {0, 3, 7, 10},
+            "m7(no5)": {0, 3, 10},
             "m7b5": {0, 3, 6, 10},
             "m9": {0, 2, 3, 7, 10},
             "m11": {0, 2, 3, 5, 7, 10},

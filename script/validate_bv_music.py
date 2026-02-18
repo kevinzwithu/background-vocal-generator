@@ -72,6 +72,7 @@ CHORD_QUALITY_INTERVALS = {
     "13": {0, 2, 4, 5, 7, 9, 10},
     "m6": {0, 3, 7, 9},
     "m7": {0, 3, 7, 10},
+    "m7(no5)": {0, 3, 10},
     "m7b5": {0, 3, 6, 10},
     "m9": {0, 2, 3, 7, 10},
     "m11": {0, 2, 3, 5, 7, 10},
@@ -534,9 +535,9 @@ def score_arrangement(
 
     if melody:
         harmony_melody = [
-            note
-            for note in melody
-            if section_at(control, float(note["time"])) != "no_bv"
+            lead_note
+            for source_note, lead_note in zip(melody, tracks["LeadDouble"])
+            if section_at(control, float(source_note["time"])) != "no_bv"
         ]
         for track_name in HIGH_TRACKS:
             wide = sum(

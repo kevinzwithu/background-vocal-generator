@@ -183,6 +183,94 @@ class MidiToJsonTest(unittest.TestCase):
 
         self.assertEqual(canonical["header"]["tempoMap"], [{"time": 0, "bpm": 130.25}])
 
+    def test_normalizes_high_melody_down_by_a_whole_octave(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [
+                        (0, TICKS_PER_BEAT, 82),
+                        (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 84),
+                    ],
+                ),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT * 2, 60),
+                        (0, TICKS_PER_BEAT * 2, 64),
+                    ],
+                ),
+            ]
+        )
+
+        canonical, _, stderr = self.convert(midi_bytes)
+
+        self.assertEqual([note["midi"] for note in canonical["melody"]], [70, 72])
+        self.assertEqual([note["name"] for note in canonical["melody"]], ["A#4", "C5"])
+        self.assertEqual(
+            stderr,
+            "Normalized melody register for harmony headroom: -12 semitones.\n",
+        )
+
+    def test_normalizes_low_melody_up_by_a_whole_octave(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [
+                        (0, TICKS_PER_BEAT, 12),
+                        (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 14),
+                    ],
+                ),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT * 2, 36),
+                        (0, TICKS_PER_BEAT * 2, 40),
+                    ],
+                ),
+            ]
+        )
+
+        canonical, _, stderr = self.convert(midi_bytes)
+
+        self.assertEqual([note["midi"] for note in canonical["melody"]], [24, 26])
+        self.assertEqual([note["name"] for note in canonical["melody"]], ["C1", "D1"])
+        self.assertEqual(
+            stderr,
+            "Normalized melody register for harmony headroom: +12 semitones.\n",
+        )
+
+    def test_rejects_melody_too_wide_for_uniform_octave_normalization(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [
+                        (0, TICKS_PER_BEAT, 12),
+                        (TICKS_PER_BEAT, TICKS_PER_BEAT * 2, 84),
+                    ],
+                ),
+                track_chunk(
+                    "chord",
+                    [
+                        (0, TICKS_PER_BEAT * 2, 48),
+                        (0, TICKS_PER_BEAT * 2, 52),
+                    ],
+                ),
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(
+                midi_to_json.MidiValidationError,
+                "no uniform whole-octave shift",
+            ):
+                midi_to_json.convert_midi_to_json(input_path, root / "output", 0.01)
+
     def test_rejects_tempo_events_finer_than_quarter_bpm(self) -> None:
         midi_bytes = midi_file(
             [

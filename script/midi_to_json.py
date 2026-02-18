@@ -26,6 +26,9 @@ except ModuleNotFoundError:
 
 C0_MIDI = 12
 C6_MIDI = 84
+HARMONY_HEADROOM_SEMITONES = 7
+PREFERRED_MELODY_MIN_MIDI = C0_MIDI + HARMONY_HEADROOM_SEMITONES
+PREFERRED_MELODY_MAX_MIDI = C6_MIDI - HARMONY_HEADROOM_SEMITONES
 MAX_BARS = project_common.MAX_BARS
 MAX_SECONDS = project_common.MAX_SECONDS
 MAX_MIDI_FILE_BYTES = 100 * 1024
@@ -133,6 +136,39 @@ def midi_name(midi: int) -> str:
 
 
 normalize_number = project_common.normalize_number
+
+
+def normalize_melody_register(
+    notes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Create upper/lower harmony headroom using one uniform octave shift."""
+    if not notes:
+        return notes, 0
+
+    minimum = min(int(note["midi"]) for note in notes)
+    maximum = max(int(note["midi"]) for note in notes)
+    candidate_shifts = sorted(range(-72, 73, 12), key=lambda shift: (abs(shift), shift))
+    for shift in candidate_shifts:
+        if (
+            minimum + shift >= PREFERRED_MELODY_MIN_MIDI
+            and maximum + shift <= PREFERRED_MELODY_MAX_MIDI
+        ):
+            if shift == 0:
+                return notes, 0
+            shifted_notes = []
+            for note in notes:
+                shifted_midi = int(note["midi"]) + shift
+                shifted_notes.append(
+                    {**note, "name": midi_name(shifted_midi), "midi": shifted_midi}
+                )
+            return shifted_notes, shift
+
+    raise MidiValidationError(
+        "melody: no uniform whole-octave shift can place the melody within "
+        f"{midi_name(PREFERRED_MELODY_MIN_MIDI)}..{midi_name(PREFERRED_MELODY_MAX_MIDI)} "
+        "while reserving upper and lower harmony headroom. "
+        f"Filtered melody range is {midi_name(minimum)}..{midi_name(maximum)}."
+    )
 
 
 def quarter_bpm_from_microseconds(microseconds_per_quarter: int) -> int | float:
@@ -902,6 +938,7 @@ def convert_midi_to_json(
         tolerance,
         "chord",
     )
+    melody_notes, melody_octave_shift = normalize_melody_register(melody_notes)
     validate_chord_alignment(chord_notes, tolerance)
     validate_no_overlapping_notes(melody_notes, "melody", tolerance)
     chord_notes = filter_non_chord_groups(chord_notes, tolerance)
@@ -952,6 +989,12 @@ def convert_midi_to_json(
         print(
             "Filtered out-of-range notes: "
             f"melody={filtered_melody}, chord={filtered_chord}",
+            file=sys.stderr,
+        )
+    if melody_octave_shift:
+        print(
+            "Normalized melody register for harmony headroom: "
+            f"{melody_octave_shift:+d} semitones.",
             file=sys.stderr,
         )
 

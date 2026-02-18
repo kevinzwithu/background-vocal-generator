@@ -50,6 +50,7 @@ CHORD_TEMPLATES = (
     ("maj7", frozenset({0, 4, 7, 11})),
     ("m6", frozenset({0, 3, 7, 9})),
     ("m7", frozenset({0, 3, 7, 10})),
+    ("m7(no5)", frozenset({0, 3, 10})),
     ("m7b5", frozenset({0, 3, 6, 10})),
     ("dim7", frozenset({0, 3, 6, 9})),
     ("aug7", frozenset({0, 4, 8, 10})),

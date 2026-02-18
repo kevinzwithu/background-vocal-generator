@@ -195,6 +195,71 @@ class BvRawToMidiTest(unittest.TestCase):
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "harmony-enabled melody note"):
                 bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
+    def test_allows_uniform_octave_transposition_of_lead_double(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "melody.json").write_text(
+                json.dumps({"header": header(), "melody": melody()}),
+                encoding="utf-8",
+            )
+            payload_tracks = melody_aligned_tracks()
+            for track_name in (
+                "LeadDouble",
+                "HHA",
+                "HHB",
+                "HHF",
+                "LHA",
+                "LHB",
+                "LHF",
+            ):
+                for note in payload_tracks[track_name]:
+                    note["midi"] += 12
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": payload_tracks}),
+                encoding="utf-8",
+            )
+
+            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+            self.assertTrue(output_path.exists())
+
+    def test_rejects_non_octave_lead_double_transposition(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "melody.json").write_text(
+                json.dumps({"header": header(), "melody": melody()}),
+                encoding="utf-8",
+            )
+            payload_tracks = melody_aligned_tracks()
+            payload_tracks["LeadDouble"][0]["midi"] += 7
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": payload_tracks}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "whole-octave"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_rejects_mixed_octave_lead_double_transposition(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "melody.json").write_text(
+                json.dumps({"header": header(), "melody": melody()}),
+                encoding="utf-8",
+            )
+            payload_tracks = melody_aligned_tracks()
+            payload_tracks["LeadDouble"][0]["midi"] += 12
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": payload_tracks}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "one uniform octave shift"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
     def test_allows_harmony_omissions_inside_no_bv_control_span(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
