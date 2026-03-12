@@ -159,6 +159,28 @@ class ChordJsonToNoteTest(unittest.TestCase):
         self.assertIn("Bar 1: beat 1 Fm7(no5)", text)
         self.assertEqual(result.warnings, ())
 
+    def test_names_six_add_nine_and_dominant_flat_nine_without_fifth(self) -> None:
+        source = payload(
+            [
+                note(50, 0),
+                note(54, 0),
+                note(57, 0),
+                note(59, 0),
+                note(64, 0),
+                note(48, 1),
+                note(52, 1),
+                note(58, 1),
+                note(61, 1),
+            ],
+            duration=3,
+            time_signature_map=[{"time": 0, "numerator": 3, "denominator": 4}],
+        )
+
+        text, result = self.convert(source)
+
+        self.assertIn("Bar 1: beat 1 D6add9 | beat 2 C7b9(no5)", text)
+        self.assertEqual(result.warnings, ())
+
     def test_reports_incomplete_triad_for_agent_review(self) -> None:
         source = payload(
             [note(60, 0), note(64, 0)],

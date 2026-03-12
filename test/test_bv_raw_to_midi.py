@@ -139,7 +139,9 @@ class BvRawToMidiTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(
+                bv_path, allow_standalone=True
+            )
             data = output_path.read_bytes()
             ticks_per_beat, parsed_tracks, _, _ = midi_to_json.parse_midi(output_path)
 
@@ -160,7 +162,9 @@ class BvRawToMidiTest(unittest.TestCase):
             bv_path = root / "bv_raw.json"
             bv_path.write_text(json.dumps({"tracks": melody_aligned_tracks()}), encoding="utf-8")
 
-            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(
+                bv_path, allow_standalone=True
+            )
             self.assertTrue(output_path.exists())
 
     def test_rejects_missing_required_track(self) -> None:
@@ -175,7 +179,7 @@ class BvRawToMidiTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "Missing BV track"):
-                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path, allow_standalone=True)
 
     def test_rejects_incomplete_harmony_when_source_melody_exists(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -220,7 +224,9 @@ class BvRawToMidiTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(
+                bv_path, allow_standalone=True
+            )
 
             self.assertTrue(output_path.exists())
 
@@ -240,7 +246,7 @@ class BvRawToMidiTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "whole-octave"):
-                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path, allow_standalone=True)
 
     def test_rejects_mixed_octave_lead_double_transposition(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -370,7 +376,9 @@ class BvRawToMidiTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(
+                bv_path, allow_standalone=True
+            )
 
             self.assertTrue(output_path.exists())
 
@@ -441,7 +449,7 @@ class BvRawToMidiTest(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "must start at time 0"):
-                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path, allow_standalone=True)
 
     def test_rejects_invalid_header_start_and_duration(self) -> None:
         cases = [
@@ -462,7 +470,9 @@ class BvRawToMidiTest(unittest.TestCase):
                 )
 
                 with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, message):
-                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+                    bv_raw_to_midi.convert_bv_raw_to_midi(
+                        bv_path, allow_standalone=True
+                    )
 
     def test_rejects_time_signature_values_that_do_not_fit_midi_bytes(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -478,7 +488,7 @@ class BvRawToMidiTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "numerator must be at most 255"):
-                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path, allow_standalone=True)
 
     def test_rejects_header_event_count_limits(self) -> None:
         cases = [
@@ -592,7 +602,7 @@ class BvRawToMidiTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "shorter than the latest BV note"):
-                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path, allow_standalone=True)
 
     def test_rejects_header_event_after_duration(self) -> None:
         cases = [
@@ -621,7 +631,9 @@ class BvRawToMidiTest(unittest.TestCase):
                     bv_raw_to_midi.BvMidiError,
                     "shorter than the latest tempo or time signature event",
                 ):
-                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+                    bv_raw_to_midi.convert_bv_raw_to_midi(
+                        bv_path, allow_standalone=True
+                    )
 
     def test_rejects_arrangements_over_piece_limits(self) -> None:
         cases = [
@@ -671,7 +683,9 @@ class BvRawToMidiTest(unittest.TestCase):
                 patch.object(bv_raw_to_midi, "MAX_SECONDS", 10**9),
                 self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "tick position exceeds"),
             ):
-                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+                bv_raw_to_midi.convert_bv_raw_to_midi(
+                    bv_path, allow_standalone=True
+                )
 
     def test_rejects_time_signature_change_off_previous_bar_boundary(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -770,6 +784,7 @@ class BvRawToMidiTest(unittest.TestCase):
                     bv_path,
                     output_path=output_path,
                     overwrite=False,
+                    allow_standalone=True,
                 )
             self.assertEqual(output_path.read_bytes(), b"existing")
 
@@ -788,7 +803,9 @@ class BvRawToMidiTest(unittest.TestCase):
                 patch.object(Path, "replace", side_effect=OSError("replace failed")),
                 self.assertRaisesRegex(OSError, "replace failed"),
             ):
-                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path, output_path=output_path)
+                bv_raw_to_midi.convert_bv_raw_to_midi(
+                    bv_path, output_path=output_path, allow_standalone=True
+                )
 
             self.assertEqual(output_path.read_bytes(), b"existing")
             self.assertEqual(list(root.glob(".*.tmp")), [])
@@ -820,7 +837,7 @@ class BvRawToMidiTest(unittest.TestCase):
                 patch.object(bv_raw_to_midi, "convert_bv_raw_to_midi", side_effect=OSError("disk full")),
                 redirect_stderr(stderr),
             ):
-                result = bv_raw_to_midi.main([str(bv_path)])
+                result = bv_raw_to_midi.main([str(bv_path), "--allow-standalone"])
 
             self.assertEqual(result, 1)
             self.assertIn("ERROR: disk full", stderr.getvalue())
@@ -843,7 +860,7 @@ class BvRawToMidiTest(unittest.TestCase):
                 redirect_stdout(stdout),
                 redirect_stderr(stderr),
             ):
-                result = bv_raw_to_midi.main([str(bv_path)])
+                result = bv_raw_to_midi.main([str(bv_path), "--allow-standalone"])
 
             self.assertEqual(result, 2)
             self.assertEqual(output_path.read_bytes(), b"existing")
@@ -868,12 +885,119 @@ class BvRawToMidiTest(unittest.TestCase):
                 redirect_stdout(stdout),
                 redirect_stderr(stderr),
             ):
-                result = bv_raw_to_midi.main([str(bv_path)])
+                result = bv_raw_to_midi.main([str(bv_path), "--allow-standalone"])
 
             self.assertEqual(result, 0)
             self.assertNotEqual(output_path.read_bytes(), b"existing")
             self.assertIn("Wrote MIDI", stdout.getvalue())
-            self.assertEqual(stderr.getvalue(), "")
+            self.assertIn("WARNING: Exported standalone MIDI", stderr.getvalue())
+
+
+class BvLyricsTest(unittest.TestCase):
+    def test_exports_source_lyrics_to_non_pad_tracks(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_melody = melody()
+            source_melody[0]["lyric"] = "Hello"
+            (root / "melody.json").write_text(
+                json.dumps({"header": header(), "melody": source_melody}),
+                encoding="utf-8",
+            )
+            payload_tracks = melody_aligned_tracks()
+            for track_name in ("LeadDouble", "HHA", "HHB", "HHF", "LHA", "LHB", "LHF"):
+                payload_tracks[track_name][0]["lyric"] = "Hello"
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": payload_tracks}),
+                encoding="utf-8",
+            )
+
+            output_path = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+            _, parsed_tracks, _, _ = midi_to_json.parse_midi(output_path)
+
+        lyrics_by_track = {track.name: [item.text for item in track.lyrics] for track in parsed_tracks}
+        for track_name in ("LeadDouble", "HHA", "HHB", "HHF", "LHA", "LHB", "LHF"):
+            self.assertEqual(lyrics_by_track[track_name], ["Hello"])
+        for track_name in ("VocalPad1", "VocalPad2", "VocalPad3", "VocalPad4"):
+            self.assertEqual(lyrics_by_track[track_name], [])
+
+    def test_rejects_wrong_inherited_lyric_and_pad_lyric(self) -> None:
+        for track_name, message in (("HHA", "must inherit lyric"), ("VocalPad1", "must not contain lyric")):
+            with self.subTest(track=track_name), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                source_melody = melody()
+                source_melody[0]["lyric"] = "Hello"
+                (root / "melody.json").write_text(
+                    json.dumps({"header": header(), "melody": source_melody}),
+                    encoding="utf-8",
+                )
+                payload_tracks = melody_aligned_tracks()
+                for name in ("LeadDouble", "HHA", "HHB", "HHF", "LHA", "LHB", "LHF"):
+                    payload_tracks[name][0]["lyric"] = "Hello"
+                payload_tracks[track_name][0]["lyric"] = "Wrong"
+                bv_path = root / "bv_raw.json"
+                bv_path.write_text(
+                    json.dumps({"header": header(), "tracks": payload_tracks}),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, message):
+                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_requires_source_by_default_and_allows_lyric_free_standalone(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": tracks()}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "Missing required source"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+            output = bv_raw_to_midi.convert_bv_raw_to_midi(
+                bv_path, allow_standalone=True
+            )
+            self.assertTrue(output.exists())
+
+    def test_rejects_lyrics_in_standalone_export(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            payload_tracks = tracks()
+            payload_tracks["LeadDouble"][0]["lyric"] = "你好"
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": payload_tracks}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "does not allow lyric"):
+                bv_raw_to_midi.convert_bv_raw_to_midi(
+                    bv_path, allow_standalone=True
+                )
+
+    def test_round_trips_utf8_chinese_lyrics(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_melody = melody()
+            source_melody[0]["lyric"] = "见面是最棒的事"
+            (root / "melody.json").write_text(
+                json.dumps({"header": header(), "melody": source_melody}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            payload_tracks = melody_aligned_tracks()
+            for name in ("LeadDouble", "HHA", "HHB", "HHF", "LHA", "LHB", "LHF"):
+                payload_tracks[name][0]["lyric"] = "见面是最棒的事"
+            bv_path = root / "bv_raw.json"
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": payload_tracks}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            output = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+            _, parsed_tracks, _, _ = midi_to_json.parse_midi(output)
+
+        lyrics = {track.name: [item.text for item in track.lyrics] for track in parsed_tracks}
+        self.assertEqual(lyrics["LeadDouble"], ["见面是最棒的事"])
 
 
 if __name__ == "__main__":

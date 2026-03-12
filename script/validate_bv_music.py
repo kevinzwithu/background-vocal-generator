@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -22,15 +23,24 @@ except ModuleNotFoundError:
     from script import project_common
 
 
-EXPECTED_NOTE_KEYS = {"name", "midi", "time", "duration"}
+BASE_NOTE_KEYS = {"name", "midi", "time", "duration"}
+NON_PAD_NOTE_KEYS = BASE_NOTE_KEYS | {"lyric"}
+PAD_NOTE_KEYS = BASE_NOTE_KEYS
 MAX_NOTE_TXT_FILE_BYTES = 100 * 1024
 MAX_BARS = project_common.MAX_BARS
 MAX_SECONDS = project_common.MAX_SECONDS
 MELODY_ALIGNED_TRACKS = ("HHA", "HHB", "HHF", "LHA", "LHB", "LHF")
 CONTOUR_TRACKS = ("HHA", "HHB", "LHA", "LHB")
+EXPRESSIVE_HARMONY_TRACKS = ("HHA", "HHB", "LHA", "LHB")
 HIGH_TRACKS = ("HHA", "HHB", "HHF")
 LOW_TRACKS = ("LHA", "LHB", "LHF")
 PAD_TRACKS = ("VocalPad1", "VocalPad2", "VocalPad3", "VocalPad4")
+PAD_PREFERRED_RANGES = {
+    "VocalPad1": (60, 84),
+    "VocalPad2": (55, 76),
+    "VocalPad3": (48, 69),
+    "VocalPad4": (36, 60),
+}
 PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 ROOTS = {
     "C": 0,
@@ -66,6 +76,7 @@ CHORD_QUALITY_INTERVALS = {
     "add2": {0, 2, 4, 7},
     "add9": {0, 2, 4, 7},
     "6": {0, 4, 7, 9},
+    "6add9": {0, 2, 4, 7, 9},
     "7": {0, 4, 7, 10},
     "9": {0, 2, 4, 7, 10},
     "11": {0, 2, 4, 5, 7, 10},
@@ -84,6 +95,7 @@ CHORD_QUALITY_INTERVALS = {
     "dim7": {0, 3, 6, 9},
     "aug7": {0, 4, 8, 10},
     "7b9": {0, 1, 4, 7, 10},
+    "7b9(no5)": {0, 1, 4, 10},
     "7sus2": {0, 2, 7, 10},
     "7sus4": {0, 5, 7, 10},
     "5": {0, 7},
@@ -177,9 +189,11 @@ def hard_validate(bv_path: Path) -> tuple[dict[str, Any] | None, list[str]]:
     for track_name, notes in tracks.items():
         for index, note in enumerate(notes):
             keys = set(note.keys())
-            if keys != EXPECTED_NOTE_KEYS:
+            allowed_keys = PAD_NOTE_KEYS if track_name in PAD_TRACKS else NON_PAD_NOTE_KEYS
+            if not BASE_NOTE_KEYS.issubset(keys) or not keys.issubset(allowed_keys):
                 errors.append(
-                    f"{track_name}[{index}] must contain only name, midi, time, duration; "
+                    f"{track_name}[{index}] must contain only allowed fields including "
+                    f"name, midi, time, duration; "
                     f"found {sorted(keys)}."
                 )
             midi = int(note["midi"])
@@ -351,12 +365,20 @@ def expected_tempo_markers(
     segments: list[TimeSignatureSegment],
 ) -> dict[int, float]:
     markers: dict[int, float] = {}
-    for item in header["tempoMap"]:
-        bar = bar_key(float(item["time"]), segments)
-        bpm = float(item["bpm"])
-        if bar in markers and markers[bar] != bpm:
-            raise ValueError(f"Multiple BPM changes in bar {bar} cannot be represented in note.txt.")
-        markers[bar] = bpm
+    tempo_map = header["tempoMap"]
+    tempo_index = 0
+    previous_bpm: float | None = None
+    for bar in range(1, expected_bar_count(header, segments) + 1):
+        bar_start = bar_beat_to_time(bar, 1, segments)
+        while (
+            tempo_index + 1 < len(tempo_map)
+            and float(tempo_map[tempo_index + 1]["time"]) <= bar_start + 1e-9
+        ):
+            tempo_index += 1
+        bpm = float(tempo_map[tempo_index]["bpm"])
+        if bpm != previous_bpm:
+            markers[bar] = bpm
+            previous_bpm = bpm
     return markers
 
 
@@ -479,6 +501,210 @@ def active_chord(events: list[tuple[float, set[int] | None, str]], time: float) 
     return pcs, name
 
 
+def paired_duplicate_rate(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+) -> float:
+    count = min(len(left), len(right))
+    if count == 0:
+        return 0.0
+    duplicate = sum(
+        1
+        for left_note, right_note in zip(left, right)
+        if int(left_note["midi"]) == int(right_note["midi"])
+    )
+    return duplicate / count
+
+
+def is_phrase_boundary(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    control: list[SectionSpan],
+    segments: list[TimeSignatureSegment],
+) -> bool:
+    previous_end = note_end(previous)
+    current_time = float(current["time"])
+    if current_time - previous_end >= 0.5 - 1e-9:
+        return True
+    if section_at(control, float(previous["time"])) != section_at(control, current_time):
+        return True
+    segment = segment_for_time(segments, current_time)
+    offset = max(0.0, current_time - segment.start)
+    remainder = offset % segment.bar_length
+    return min(remainder, segment.bar_length - remainder) <= 1e-9
+
+
+def pad_snapshots(
+    tracks: dict[str, list[dict[str, Any]]],
+) -> list[tuple[float, dict[str, dict[str, Any]]]]:
+    events: list[tuple[float, int, str, dict[str, Any]]] = []
+    for track_name in PAD_TRACKS:
+        for note in tracks[track_name]:
+            events.append((float(note["time"]), 1, track_name, note))
+            events.append((note_end(note), 0, track_name, note))
+    events.sort(key=lambda event: (event[0], event[1], event[2]))
+
+    active: dict[str, dict[str, Any]] = {}
+    snapshots: list[tuple[float, dict[str, dict[str, Any]]]] = []
+    index = 0
+    while index < len(events):
+        time = events[index][0]
+        while index < len(events) and events[index][0] == time:
+            _, kind, track_name, note = events[index]
+            if kind == 0:
+                active.pop(track_name, None)
+            else:
+                active[track_name] = note
+            index += 1
+        if active:
+            snapshots.append((time, dict(active)))
+    return snapshots
+
+
+def score_pad_writing(
+    tracks: dict[str, list[dict[str, Any]]],
+    segments: list[TimeSignatureSegment],
+) -> tuple[int, list[str], list[str]]:
+    deductions = 0
+    warnings: list[str] = []
+    suggestions: list[str] = []
+    issue_categories = 0
+
+    repeated_tracks: list[str] = []
+    for track_name in PAD_TRACKS:
+        midis = [int(note["midi"]) for note in tracks[track_name]]
+        if len(midis) >= 8 and len(set(midis)) <= max(1, len(midis) // 6):
+            repeated_tracks.append(track_name)
+    if repeated_tracks:
+        warnings.append(f"Pad voices have prolonged pitch repetition: {', '.join(repeated_tracks)}.")
+        suggestions.append("Give repeated pad voices more common-tone releases or stepwise voice leading.")
+        deductions += min(8, len(repeated_tracks) * 2)
+        issue_categories += 1
+
+    range_issues: list[str] = []
+    range_issue_count = 0
+    for track_name, (low, high) in PAD_PREFERRED_RANGES.items():
+        outside = sum(
+            1
+            for note in tracks[track_name]
+            if not low <= int(note["midi"]) <= high
+        )
+        if outside:
+            range_issues.append(f"{track_name}={outside}")
+            range_issue_count += outside
+    if range_issues:
+        warnings.append(f"Pad voices leave their preferred four-part registers: {', '.join(range_issues)}.")
+        suggestions.append("Revoice pads into distinct soprano, alto, tenor, and bass-like registers.")
+        deductions += min(8, range_issue_count)
+        issue_categories += 1
+
+    pad_large_leaps: list[str] = []
+    pad_large_leap_count = 0
+    for track_name in PAD_TRACKS:
+        notes = sorted(tracks[track_name], key=lambda note: float(note["time"]))
+        large_leaps = sum(
+            1
+            for index in range(1, len(notes))
+            if not is_phrase_boundary(notes[index - 1], notes[index], [], segments)
+            and abs(int(notes[index]["midi"]) - int(notes[index - 1]["midi"])) > 7
+        )
+        if large_leaps:
+            pad_large_leaps.append(f"{track_name}={large_leaps}")
+            pad_large_leap_count += large_leaps
+    if pad_large_leaps:
+        warnings.append(
+            f"Pad voices have large non-boundary leaps: {', '.join(pad_large_leaps)}."
+        )
+        suggestions.append("Use common tones and stepwise motion to smooth pad voice leading.")
+        deductions += min(8, pad_large_leap_count)
+        issue_categories += 1
+
+    snapshots = pad_snapshots(tracks)
+    if snapshots:
+        incomplete = sum(1 for _, active in snapshots if len(active) < 3)
+        incomplete_rate = incomplete / len(snapshots)
+        if len(snapshots) >= 4 and incomplete_rate > 0.4:
+            warnings.append(
+                f"Pad texture uses fewer than three active voices on {incomplete_rate:.0%} of pad snapshots."
+            )
+            suggestions.append("Use fuller three- or four-part pad voicings when the pad texture is active.")
+            deductions += min(8, math.ceil(incomplete_rate * 8))
+            issue_categories += 1
+
+        crossings = 0
+        wide_spacing = 0
+        for _, active in snapshots:
+            active_order = [track_name for track_name in PAD_TRACKS if track_name in active]
+            if any(
+                int(active[upper]["midi"]) <= int(active[lower]["midi"])
+                for upper, lower in zip(active_order, active_order[1:])
+            ):
+                crossings += 1
+            if any(
+                int(active[upper]["midi"]) - int(active[lower]["midi"])
+                > (19 if (upper, lower) == ("VocalPad3", "VocalPad4") else 12)
+                for upper, lower in zip(active_order, active_order[1:])
+            ):
+                wide_spacing += 1
+        if crossings:
+            warnings.append(f"Pad voice crossing appears in {crossings} snapshots.")
+            suggestions.append("Keep the pad voice order stable unless a crossing is musically intentional.")
+            deductions += min(10, crossings)
+            issue_categories += 1
+        if wide_spacing:
+            warnings.append(f"Pad adjacent-voice spacing is unusually wide in {wide_spacing} snapshots.")
+            suggestions.append("Keep adjacent upper pad voices within an octave and control tenor-bass gaps.")
+            deductions += min(8, wide_spacing)
+            issue_categories += 1
+
+        rigid_transitions = 0
+        comparable_transitions = 0
+        for (_, previous), (_, current) in zip(snapshots, snapshots[1:]):
+            if set(previous) != set(PAD_TRACKS) or set(current) != set(PAD_TRACKS):
+                continue
+            deltas = [
+                int(current[track_name]["midi"]) - int(previous[track_name]["midi"])
+                for track_name in PAD_TRACKS
+            ]
+            if not any(deltas):
+                continue
+            comparable_transitions += 1
+            nonzero = [delta for delta in deltas if delta]
+            same_direction = all(delta > 0 for delta in nonzero) or all(
+                delta < 0 for delta in nonzero
+            )
+            identical_motion = len(set(deltas)) == 1
+            if identical_motion or (same_direction and len(nonzero) == len(PAD_TRACKS)):
+                rigid_transitions += 1
+        rigid_rate = rigid_transitions / max(1, comparable_transitions)
+        if comparable_transitions >= 3 and rigid_rate > 0.5:
+            warnings.append(
+                f"Pad voices move as rigid parallel blocks on {rigid_rate:.0%} of comparable transitions."
+            )
+            suggestions.append("Add common tones, contrary motion, and independent inner-voice movement.")
+            deductions += min(10, math.ceil(rigid_rate * 10))
+            issue_categories += 1
+
+    notes_by_bar: dict[int, int] = {}
+    for track_name in PAD_TRACKS:
+        for note in tracks[track_name]:
+            bar = bar_key(float(note["time"]), segments)
+            notes_by_bar[bar] = notes_by_bar.get(bar, 0) + 1
+    dense_bars = [bar for bar, count in notes_by_bar.items() if count > 24]
+    if dense_bars:
+        warnings.append(f"Pad note density is unusually high in bars {dense_bars[:8]}.")
+        suggestions.append("Reduce pad movement or let some voices sustain through dense bars.")
+        deductions += min(8, len(dense_bars))
+        issue_categories += 1
+
+    if issue_categories >= 3:
+        warnings.append("Multiple pad-writing risks reduce the overall arrangement balance.")
+        suggestions.append("Review the pad texture as a complete four-part arrangement, not as isolated tracks.")
+        deductions += 4
+
+    return deductions, warnings, suggestions
+
+
 def score_arrangement(
     bv_path: Path,
     payload: dict[str, Any],
@@ -514,23 +740,28 @@ def score_arrangement(
 
     for track_name in MELODY_ALIGNED_TRACKS:
         notes = tracks[track_name]
-        leaps = [
+        large_leaps = [
             abs(int(notes[index]["midi"]) - int(notes[index - 1]["midi"]))
             for index in range(1, len(notes))
+            if not is_phrase_boundary(notes[index - 1], notes[index], control, segments)
+            and abs(int(notes[index]["midi"]) - int(notes[index - 1]["midi"])) > 7
         ]
-        large_leaps = [leap for leap in leaps if leap > 7]
         if large_leaps:
-            warnings.append(f"{track_name} has {len(large_leaps)} leaps larger than a fifth.")
-            suggestions.append(f"Smooth large jumps in {track_name} unless they mark a phrase boundary.")
+            warnings.append(
+                f"{track_name} has {len(large_leaps)} leaps larger than a fifth away from phrase boundaries."
+            )
+            suggestions.append(f"Smooth non-boundary large jumps in {track_name}.")
             deductions += min(8, len(large_leaps))
 
-    if tracks["HHA"] and tracks["HHB"]:
-        paired = zip(tracks["HHA"], tracks["HHB"])
-        duplicate = sum(1 for left, right in paired if int(left["midi"]) == int(right["midi"]))
-        rate = duplicate / max(1, min(len(tracks["HHA"]), len(tracks["HHB"])))
+    for left_name, right_name in (("HHA", "HHB"), ("LHA", "LHB")):
+        rate = paired_duplicate_rate(tracks[left_name], tracks[right_name])
         if rate > 0.2:
-            warnings.append(f"HHA and HHB duplicate each other on {rate:.0%} of aligned notes.")
-            suggestions.append("Separate HHA and HHB into distinct upper harmony functions.")
+            warnings.append(
+                f"{left_name} and {right_name} duplicate each other on {rate:.0%} of aligned notes."
+            )
+            suggestions.append(
+                f"Separate {left_name} and {right_name} into distinct harmony functions."
+            )
             deductions += min(12, round(rate * 20))
 
     if melody:
@@ -557,6 +788,31 @@ def score_arrangement(
             if wide:
                 warnings.append(f"{track_name} sits more than an octave below melody on {wide} notes.")
                 deductions += min(6, wide)
+
+        for track_name in EXPRESSIVE_HARMONY_TRACKS:
+            outside_preferred = sum(
+                1
+                for melody_note, harmony_note in zip(harmony_melody, tracks[track_name])
+                if not 2
+                <= abs(int(harmony_note["midi"]) - int(melody_note["midi"]))
+                <= 6
+            )
+            rate = outside_preferred / max(1, len(tracks[track_name]))
+            if rate > 0.25:
+                warnings.append(
+                    f"{track_name} falls outside the preferred 2-4 scale-degree spacing "
+                    f"on {rate:.0%} of aligned notes."
+                )
+                suggestions.append(
+                    f"Keep most {track_name} notes within roughly 2-6 semitones of the melody; "
+                    "use fifth-degree spacing only occasionally."
+                )
+                deductions += min(8, math.ceil(rate * 8))
+
+    pad_deductions, pad_warnings, pad_suggestions = score_pad_writing(tracks, segments)
+    deductions += pad_deductions
+    warnings.extend(pad_warnings)
+    suggestions.extend(pad_suggestions)
 
     events = chord_events(bv_path.parent / "note.txt", header)
     chord_misses = 0

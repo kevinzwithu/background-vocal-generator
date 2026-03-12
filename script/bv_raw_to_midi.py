@@ -27,6 +27,9 @@ MAX_NOTES_PER_TRACK = 50_000
 MAX_TOTAL_NOTES = 200_000
 MAX_SOURCE_MELODY_NOTES = 50_000
 MAX_CONTROL_EVENTS = 50_000
+MAX_LYRIC_BYTES = 4096
+MAX_TOTAL_LYRIC_BYTES = 100 * 1024
+MAX_INTEGER_TEXT_DIGITS = 1024
 MAX_TEMPO_EVENTS = project_common.MAX_TEMPO_EVENTS
 MAX_TIME_SIGNATURE_EVENTS = project_common.MAX_TIME_SIGNATURE_EVENTS
 MAX_MIDI_VLQ = 0x0FFFFFFF
@@ -52,6 +55,7 @@ EXPECTED_TRACKS = (
 )
 
 MELODY_ALIGNED_TRACKS = ("HHA", "HHB", "HHF", "LHA", "LHB", "LHF")
+PAD_TRACKS = ("VocalPad1", "VocalPad2", "VocalPad3", "VocalPad4")
 HIGH_HARMONY_TRACKS = ("HHA", "HHB", "HHF")
 LOW_HARMONY_TRACKS = ("LHA", "LHB", "LHF")
 
@@ -129,7 +133,7 @@ def require_int(item: dict[str, Any], key: str, label: str) -> int:
     if isinstance(value, str):
         stripped = value.strip()
         signless = stripped[1:] if stripped.startswith(("+", "-")) else stripped
-        if signless.isdigit():
+        if signless.isdigit() and len(signless) <= MAX_INTEGER_TEXT_DIGITS:
             try:
                 return int(stripped)
             except ValueError as exc:
@@ -173,6 +177,12 @@ def reject_if_over_limit(value: int, limit: int, label: str) -> None:
         raise BvMidiError(f"{label} exceeds limit of {limit}.")
 
 
+def parse_bounded_json_int(text: str) -> int:
+    if len(text.lstrip("+-")) > MAX_INTEGER_TEXT_DIGITS:
+        raise ValueError("integer literal is too long")
+    return int(text)
+
+
 def read_json(path: Path) -> dict[str, Any]:
     try:
         if not path.exists():
@@ -186,7 +196,7 @@ def read_json(path: Path) -> dict[str, Any]:
     except OSError as exc:
         raise BvMidiError(f"Unable to inspect or read JSON file {path}: {exc}") from exc
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"), parse_int=parse_bounded_json_int)
     except UnicodeDecodeError as exc:
         raise BvMidiError(f"JSON file must use UTF-8 encoding: {path}") from exc
     except (json.JSONDecodeError, ValueError, RecursionError) as exc:
@@ -233,6 +243,24 @@ def sibling_control(bv_path: Path) -> list[dict[str, Any]]:
                 reject_if_over_limit(len(control), MAX_CONTROL_EVENTS, "Control event count")
                 return control
     return []
+
+
+def validate_source_requirement(
+    tracks: dict[str, list[dict[str, Any]]],
+    melody: list[dict[str, Any]] | None,
+    allow_standalone: bool,
+) -> None:
+    if melody is not None:
+        return
+    if not allow_standalone:
+        raise BvMidiError(
+            "Missing required source melody.json or canonical.json beside bv_raw.json. "
+            "Use --allow-standalone only for legacy projects without lyrics."
+        )
+    if any("lyric" in note for notes in tracks.values() for note in notes):
+        raise BvMidiError(
+            "Standalone export does not allow lyric fields because source melody is unavailable."
+        )
 
 
 def resolve_header(payload: dict[str, Any], bv_path: Path) -> dict[str, Any]:
@@ -423,6 +451,7 @@ def validate_notes(
     tolerance: float,
 ) -> float:
     max_end = 0.0
+    total_lyric_bytes = 0
     for track_name, notes in tracks.items():
         track_notes: list[tuple[float, float, int, dict[str, Any]]] = []
         for note in notes:
@@ -436,6 +465,17 @@ def validate_notes(
             start = require_number(note, "time", label)
             duration = require_number(note, "duration", label)
             end = start + duration
+            if "lyric" in note:
+                if track_name in PAD_TRACKS:
+                    raise BvMidiError(f"Track {track_name} note must not contain lyric.")
+                lyric = note["lyric"]
+                if not isinstance(lyric, str):
+                    raise BvMidiError(f"Track {track_name} note lyric must be a string.")
+                if "\x00" in lyric:
+                    raise BvMidiError(f"Track {track_name} note lyric must not contain NUL.")
+                lyric_bytes = len(lyric.encode("utf-8"))
+                reject_if_over_limit(lyric_bytes, MAX_LYRIC_BYTES, "Lyric size")
+                total_lyric_bytes += lyric_bytes
 
             max_midi = C6_MIDI if track_name == "LeadDouble" else BV_HARMONY_MAX_MIDI
             if midi < C0_MIDI or midi > max_midi:
@@ -474,6 +514,7 @@ def validate_notes(
                 )
             previous_end = max(previous_end, end)
             previous_note = note
+    reject_if_over_limit(total_lyric_bytes, MAX_TOTAL_LYRIC_BYTES, "Total lyric size")
     return max_end
 
 
@@ -531,6 +572,8 @@ def validate_melody_aligned_harmonies(
         require_int(melody_note, "midi", label)
         require_number(melody_note, "time", label)
         require_number(melody_note, "duration", label)
+        if "lyric" in melody_note and not isinstance(melody_note["lyric"], str):
+            raise BvMidiError(f"{label}.lyric must be a string.")
 
     lead_double = tracks["LeadDouble"]
     if len(lead_double) != len(melody):
@@ -571,6 +614,12 @@ def validate_melody_aligned_harmonies(
                 "LeadDouble pitch changes must use one uniform octave shift for the entire melody. "
                 f"Expected {octave_shift} semitones, found {shift} at index {index}."
             )
+        expected_lyric = melody_note.get("lyric")
+        if lead_note.get("lyric") != expected_lyric:
+            raise BvMidiError(
+                f"Track LeadDouble note at time={melody_note['time']} must inherit "
+                f"lyric {expected_lyric!r}; found {lead_note.get('lyric')!r}."
+            )
 
     harmony_lead = [
         lead_note
@@ -606,6 +655,52 @@ def validate_melody_aligned_harmonies(
                     f"{track_name} must be lower than melody at index {index}. "
                     f"melody={melody_midi}, harmony={harmony_midi}."
                 )
+            expected_lyric = harmony_melody[index].get("lyric")
+            if harmony_note.get("lyric") != expected_lyric:
+                raise BvMidiError(
+                    f"Track {track_name} note at time={melody_note['time']} must inherit "
+                    f"lyric {expected_lyric!r}; found {harmony_note.get('lyric')!r}."
+                )
+
+
+def tracks_with_source_lyrics(
+    tracks: dict[str, list[dict[str, Any]]],
+    melody: list[dict[str, Any]] | None,
+    control: list[dict[str, Any]] | None,
+    tolerance: float,
+) -> dict[str, list[dict[str, Any]]]:
+    output = {name: [dict(note) for note in notes] for name, notes in tracks.items()}
+    if melody is None:
+        return output
+
+    no_bv_spans = [
+        (
+            require_number(item, "time", "Source control item"),
+            require_number(item, "time", "Source control item")
+            + require_number(item, "duration", "Source control item"),
+        )
+        for item in control or []
+        if isinstance(item, dict) and item.get("section") == "no_bv"
+    ]
+
+    def enabled(note: dict[str, Any]) -> bool:
+        start = float(note["time"])
+        return not any(a - tolerance <= start < b - tolerance for a, b in no_bv_spans)
+
+    for target, source in zip(output["LeadDouble"], melody):
+        target.pop("lyric", None)
+        if "lyric" in source:
+            target["lyric"] = source["lyric"]
+    harmony_melody = [note for note in melody if enabled(note)]
+    for track_name in MELODY_ALIGNED_TRACKS:
+        for target, source in zip(output[track_name], harmony_melody):
+            target.pop("lyric", None)
+            if "lyric" in source:
+                target["lyric"] = source["lyric"]
+    for track_name in PAD_TRACKS:
+        for target in output[track_name]:
+            target.pop("lyric", None)
+    return output
 
 
 def vlq(value: int) -> bytes:
@@ -687,8 +782,10 @@ def note_track(
         midi = int(note["midi"])
         start_tick = beats_to_ticks(float(note["time"]), ticks_per_beat)
         end_note_tick = beats_to_ticks(float(note["time"]) + float(note["duration"]), ticks_per_beat)
-        events.append((end_note_tick, 1, bytes([0x80, midi, 0])))
-        events.append((start_tick, 2, bytes([0x90, midi, velocity])))
+        if "lyric" in note:
+            events.append((start_tick, 1, meta_event(0x05, note["lyric"].encode("utf-8"))))
+        events.append((end_note_tick, 2, bytes([0x80, midi, 0])))
+        events.append((start_tick, 3, bytes([0x90, midi, velocity])))
 
     return track_chunk(events, end_tick)
 
@@ -751,6 +848,7 @@ def convert_bv_raw_to_midi(
     velocity: int = 80,
     tolerance: float = 0.01,
     overwrite: bool = True,
+    allow_standalone: bool = False,
 ) -> Path:
     validate_export_options(ticks_per_beat, velocity, tolerance)
     payload = read_json(bv_path)
@@ -759,15 +857,19 @@ def convert_bv_raw_to_midi(
     segments = build_time_signature_segments(header)
     validate_piece_limits(header, segments)
     max_note_end = validate_notes(tracks, segments, tolerance)
+    melody = sibling_melody(bv_path)
+    control = sibling_control(bv_path)
+    validate_source_requirement(tracks, melody, allow_standalone)
     validate_melody_aligned_harmonies(
         tracks,
-        sibling_melody(bv_path),
+        melody,
         tolerance,
-        sibling_control(bv_path),
+        control,
     )
+    effective_tracks = tracks_with_source_lyrics(tracks, melody, control, tolerance)
 
     destination = output_path or (bv_path.parent / "bv.mid")
-    write_midi(destination, header, tracks, ticks_per_beat, velocity, max_note_end, overwrite)
+    write_midi(destination, header, effective_tracks, ticks_per_beat, velocity, max_note_end, overwrite)
     return destination
 
 
@@ -800,6 +902,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=0.01,
         help="Quantization tolerance in beats. Default: 0.01",
+    )
+    parser.add_argument(
+        "--allow-standalone",
+        action="store_true",
+        help="Allow legacy export without source melody; lyric fields remain forbidden.",
     )
     return parser.parse_args(argv)
 
@@ -842,11 +949,17 @@ def main(argv: list[str] | None = None) -> int:
             args.velocity,
             args.tolerance,
             overwrite=destination_exists,
+            allow_standalone=args.allow_standalone,
         )
     except (BvMidiError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    if args.allow_standalone and sibling_melody(bv_path) is None:
+        print(
+            "WARNING: Exported standalone MIDI without source melody alignment or lyrics.",
+            file=sys.stderr,
+        )
     print(f"Wrote MIDI to {destination}")
     return 0
 

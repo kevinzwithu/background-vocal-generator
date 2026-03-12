@@ -139,6 +139,250 @@ class ValidateBvMusicTest(unittest.TestCase):
         self.assertGreaterEqual(report["score"], 80)
         self.assertEqual(report["hardErrors"], [])
 
+    def test_scores_duplicate_lower_harmony_pair(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload_tracks = tracks()
+            payload_tracks["LHB"] = [dict(note) for note in payload_tracks["LHA"]]
+            bv_path = self.write_project(Path(temp_dir), payload_tracks)
+
+            report, _ = validate_bv_music.validate(bv_path, min_score=0)
+
+        self.assertTrue(
+            any("LHA and LHB duplicate each other" in warning for warning in report["warnings"])
+        )
+
+    def test_scores_expressive_harmony_outside_preferred_spacing(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bv_path = self.write_project(Path(temp_dir), tracks())
+
+            report, _ = validate_bv_music.validate(bv_path, min_score=0)
+
+        self.assertTrue(
+            any(
+                "LHA falls outside the preferred 2-4 scale-degree spacing" in warning
+                for warning in report["warnings"]
+            )
+        )
+
+    def test_large_leap_at_phrase_boundary_is_not_scored(self) -> None:
+        segments = validate_bv_music.build_time_signature_segments(
+            {
+                **header(),
+                "duration": 8,
+            }
+        )
+        previous = {"name": "C4", "midi": 60, "time": 3, "duration": 1}
+        current = {"name": "C5", "midi": 72, "time": 4, "duration": 1}
+
+        self.assertTrue(
+            validate_bv_music.is_phrase_boundary(previous, current, [], segments)
+        )
+
+    def test_large_leap_inside_phrase_is_scored(self) -> None:
+        segments = validate_bv_music.build_time_signature_segments(header())
+        previous = {"name": "C4", "midi": 60, "time": 0, "duration": 1}
+        current = {"name": "C5", "midi": 72, "time": 1, "duration": 1}
+
+        self.assertFalse(
+            validate_bv_music.is_phrase_boundary(previous, current, [], segments)
+        )
+
+    def test_score_reports_large_leap_inside_phrase(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload_tracks = tracks()
+            payload_tracks["HHA"][1]["midi"] = 76
+            payload_tracks["HHA"][1]["name"] = "E5"
+            bv_path = self.write_project(Path(temp_dir), payload_tracks)
+
+            report, _ = validate_bv_music.validate(bv_path, min_score=0)
+
+        self.assertTrue(
+            any(
+                "HHA has 1 leaps larger than a fifth away from phrase boundaries" in warning
+                for warning in report["warnings"]
+            )
+        )
+
+    def test_scores_rigid_parallel_pad_motion(self) -> None:
+        payload_tracks = tracks()
+        bases = {
+            "VocalPad1": 72,
+            "VocalPad2": 67,
+            "VocalPad3": 60,
+            "VocalPad4": 48,
+        }
+        for track_name, base in bases.items():
+            payload_tracks[track_name] = [
+                {
+                    "name": validate_bv_music.midi_name(base + index * 2),
+                    "midi": base + index * 2,
+                    "time": index,
+                    "duration": 1,
+                }
+                for index in range(4)
+            ]
+
+        _, warnings, _ = validate_bv_music.score_pad_writing(
+            payload_tracks,
+            validate_bv_music.build_time_signature_segments(
+                {
+                    **header(),
+                    "duration": 4,
+                }
+            ),
+        )
+
+        self.assertTrue(any("rigid parallel blocks" in warning for warning in warnings))
+
+    def test_scores_large_pad_leap_inside_phrase(self) -> None:
+        payload_tracks = tracks()
+        payload_tracks["VocalPad1"] = [
+            {"name": "C5", "midi": 72, "time": 0, "duration": 1},
+            {"name": "C6", "midi": 84, "time": 1, "duration": 1},
+        ]
+
+        _, warnings, _ = validate_bv_music.score_pad_writing(
+            payload_tracks,
+            validate_bv_music.build_time_signature_segments(header()),
+        )
+
+        self.assertTrue(any("large non-boundary leaps" in warning for warning in warnings))
+
+    def test_scores_pad_crossing_and_register_issues(self) -> None:
+        payload_tracks = tracks()
+        pad_midis = {
+            "VocalPad1": 48,
+            "VocalPad2": 72,
+            "VocalPad3": 55,
+            "VocalPad4": 84,
+        }
+        for track_name, midi in pad_midis.items():
+            payload_tracks[track_name] = [
+                {
+                    "name": validate_bv_music.midi_name(midi),
+                    "midi": midi,
+                    "time": 0,
+                    "duration": 1,
+                }
+            ]
+
+        _, warnings, _ = validate_bv_music.score_pad_writing(
+            payload_tracks,
+            validate_bv_music.build_time_signature_segments(header()),
+        )
+
+        self.assertTrue(any("voice crossing" in warning for warning in warnings))
+        self.assertTrue(any("preferred four-part registers" in warning for warning in warnings))
+
+    def test_scores_wide_adjacent_pad_voice_spacing(self) -> None:
+        payload_tracks = tracks()
+        pad_midis = {
+            "VocalPad1": 72,
+            "VocalPad2": 55,
+            "VocalPad3": 48,
+            "VocalPad4": 36,
+        }
+        for track_name, midi in pad_midis.items():
+            payload_tracks[track_name] = [
+                {
+                    "name": validate_bv_music.midi_name(midi),
+                    "midi": midi,
+                    "time": 0,
+                    "duration": 1,
+                }
+            ]
+
+        _, warnings, _ = validate_bv_music.score_pad_writing(
+            payload_tracks,
+            validate_bv_music.build_time_signature_segments(header()),
+        )
+
+        self.assertTrue(any("adjacent-voice spacing is unusually wide" in warning for warning in warnings))
+
+    def test_scores_sparse_and_repetitive_pad_texture(self) -> None:
+        payload_tracks = tracks()
+        payload_tracks["VocalPad1"] = [
+            {
+                "name": "C5",
+                "midi": 72,
+                "time": index,
+                "duration": 1,
+            }
+            for index in range(8)
+        ]
+
+        _, warnings, _ = validate_bv_music.score_pad_writing(
+            payload_tracks,
+            validate_bv_music.build_time_signature_segments(
+                {
+                    **header(),
+                    "duration": 8,
+                }
+            ),
+        )
+
+        self.assertTrue(any("prolonged pitch repetition" in warning for warning in warnings))
+        self.assertTrue(any("fewer than three active voices" in warning for warning in warnings))
+
+    def test_scores_excessive_pad_density(self) -> None:
+        payload_tracks = tracks()
+        for track_index, track_name in enumerate(validate_bv_music.PAD_TRACKS):
+            midi = 72 - track_index * 7
+            payload_tracks[track_name] = [
+                {
+                    "name": validate_bv_music.midi_name(midi),
+                    "midi": midi,
+                    "time": index / 8,
+                    "duration": 0.125,
+                }
+                for index in range(8)
+            ]
+
+        _, warnings, _ = validate_bv_music.score_pad_writing(
+            payload_tracks,
+            validate_bv_music.build_time_signature_segments(
+                {
+                    **header(),
+                    "duration": 4,
+                }
+            ),
+        )
+
+        self.assertTrue(any("density is unusually high" in warning for warning in warnings))
+
+    def test_scores_combined_pad_arrangement_balance_risks(self) -> None:
+        payload_tracks = tracks()
+        pad_midis = {
+            "VocalPad1": 48,
+            "VocalPad2": 72,
+            "VocalPad3": 55,
+            "VocalPad4": 84,
+        }
+        for track_name, midi in pad_midis.items():
+            payload_tracks[track_name] = [
+                {
+                    "name": validate_bv_music.midi_name(midi),
+                    "midi": midi,
+                    "time": index,
+                    "duration": 1,
+                }
+                for index in range(8)
+            ]
+
+        _, warnings, _ = validate_bv_music.score_pad_writing(
+            payload_tracks,
+            validate_bv_music.build_time_signature_segments(
+                {
+                    **header(),
+                    "duration": 8,
+                }
+            ),
+        )
+
+        self.assertTrue(
+            any("overall arrangement balance" in warning for warning in warnings)
+        )
+
     def test_passes_uniform_octave_transposed_lead_and_harmonies(self) -> None:
         with TemporaryDirectory() as temp_dir:
             payload_tracks = tracks()
@@ -173,6 +417,30 @@ class ValidateBvMusicTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertFalse(report["passed"])
         self.assertIn("must contain only", report["hardErrors"][0])
+
+    def test_fails_hard_validation_for_missing_inherited_lyric(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = melody()
+            source[0]["lyric"] = "Hello"
+            payload_tracks = tracks()
+            for track_name in ("LeadDouble", "HHA", "HHB", "HHF", "LHA", "LHB", "LHF"):
+                payload_tracks[track_name][0]["lyric"] = "Hello"
+            bv_path = self.write_project(root, payload_tracks)
+            (root / "melody.json").write_text(
+                json.dumps({"header": header(), "melody": source}),
+                encoding="utf-8",
+            )
+            del payload_tracks["HHA"][0]["lyric"]
+            bv_path.write_text(
+                json.dumps({"header": header(), "tracks": payload_tracks}),
+                encoding="utf-8",
+            )
+
+            report, exit_code = validate_bv_music.validate(bv_path, min_score=80)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("must inherit lyric", report["hardErrors"][0])
 
     def test_fails_when_note_txt_is_missing(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -412,7 +680,7 @@ class ValidateBvMusicTest(unittest.TestCase):
                     validate_bv_music.chord_events(note_txt, chart_header)
 
     def test_active_chord_uses_logarithmic_lookup(self) -> None:
-        class CountingEvents(list[tuple[float, set[int] | None, str]]):
+        class CountingEvents(list):
             def __init__(self, values: list[tuple[float, set[int] | None, str]]) -> None:
                 super().__init__(values)
                 self.lookups = 0
@@ -532,6 +800,29 @@ class ValidateBvMusicTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     validate_bv_music.chord_events(note_txt, chart_header)
 
+    def test_chord_events_samples_mid_bar_tempo_changes_at_bar_starts(self) -> None:
+        chart_header = header()
+        chart_header["duration"] = 8
+        chart_header["tempoMap"] = [
+            {"time": 0, "bpm": 120},
+            {"time": 2, "bpm": 96},
+            {"time": 3, "bpm": 108},
+        ]
+        with TemporaryDirectory() as temp_dir:
+            note_txt = Path(temp_dir) / "note.txt"
+            self.write_note_chart(
+                note_txt,
+                ["Bar 1: beat 1 C", "Bar 2: beat 1 F"],
+                [
+                    "Bar 1: Time Signature 4/4, BPM 120",
+                    "Bar 2: BPM 108",
+                ],
+            )
+
+            events = validate_bv_music.chord_events(note_txt, chart_header)
+
+        self.assertEqual(len(events), 2)
+
     def test_chord_pitch_classes_supports_all_declared_qualities(self) -> None:
         expected = {
             "": {0, 4, 7},
@@ -544,6 +835,7 @@ class ValidateBvMusicTest(unittest.TestCase):
             "add2": {0, 2, 4, 7},
             "add9": {0, 2, 4, 7},
             "6": {0, 4, 7, 9},
+            "6add9": {0, 2, 4, 7, 9},
             "7": {0, 4, 7, 10},
             "9": {0, 2, 4, 7, 10},
             "11": {0, 2, 4, 5, 7, 10},
@@ -562,6 +854,7 @@ class ValidateBvMusicTest(unittest.TestCase):
             "dim7": {0, 3, 6, 9},
             "aug7": {0, 4, 8, 10},
             "7b9": {0, 1, 4, 7, 10},
+            "7b9(no5)": {0, 1, 4, 10},
             "7sus2": {0, 2, 7, 10},
             "7sus4": {0, 5, 7, 10},
             "5": {0, 7},

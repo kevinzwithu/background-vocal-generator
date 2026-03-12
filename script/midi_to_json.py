@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a melody/chord MIDI file into project canonical JSON.
+"""Convert MIDI melody/chord/control tracks into project canonical JSON.
 
 The parser intentionally uses only the Python standard library so the first
 project phase can run without installing dependencies.
@@ -8,6 +8,7 @@ project phase can run without installing dependencies.
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import math
 import os
@@ -38,6 +39,10 @@ MAX_PARSED_NOTES = 50_000
 MAX_TEMPO_EVENTS = project_common.MAX_TEMPO_EVENTS
 MAX_TIME_SIGNATURE_EVENTS = project_common.MAX_TIME_SIGNATURE_EVENTS
 MAX_TOLERANCE = project_common.MAX_TOLERANCE
+MAX_LYRIC_BYTES = 4096
+MAX_TOTAL_LYRIC_BYTES = 100 * 1024
+DEFAULT_LYRIC_ENCODING = "utf-8"
+ALLOWED_LYRIC_ENCODINGS = ("utf-8", "gb18030", "big5", "latin-1")
 OUTPUT_JSON_FILENAMES = ("canonical.json", "melody.json", "chord.json")
 PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 CONTROL_SECTIONS = {
@@ -66,9 +71,17 @@ class RawNote:
 
 
 @dataclass(frozen=True)
+class RawLyric:
+    ticks: int
+    text: str
+    order: int
+
+
+@dataclass(frozen=True)
 class TrackData:
     name: str | None
     notes: list[RawNote]
+    lyrics: list[RawLyric]
 
 
 @dataclass(frozen=True)
@@ -128,6 +141,43 @@ def decode_text(raw: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace").strip()
+
+
+def normalize_lyric_encoding(encoding: str) -> str:
+    try:
+        normalized = codecs.lookup(encoding).name
+    except LookupError as exc:
+        raise MidiValidationError(f"Unsupported lyric encoding: {encoding}.") from exc
+    aliases = {
+        "utf-8": "utf-8",
+        "gb18030": "gb18030",
+        "big5": "big5",
+        "iso8859-1": "latin-1",
+    }
+    selected = aliases.get(normalized)
+    if selected is None or selected not in ALLOWED_LYRIC_ENCODINGS:
+        raise MidiValidationError(
+            "lyric_encoding must be one of: " + ", ".join(ALLOWED_LYRIC_ENCODINGS) + "."
+        )
+    return selected
+
+
+def decode_lyric(raw: bytes, encoding: str, ticks: int) -> str:
+    try:
+        text = raw.decode(encoding)
+    except UnicodeDecodeError as exc:
+        hint = (
+            " Specify --lyric-encoding gb18030, big5, or latin-1 if the MIDI "
+            "uses a legacy encoding."
+            if encoding == DEFAULT_LYRIC_ENCODING
+            else ""
+        )
+        raise MidiParseError(
+            f"Lyric event at tick {ticks} is not valid {encoding}.{hint}"
+        ) from exc
+    if "\x00" in text:
+        raise MidiParseError("Lyric meta event must not contain NUL characters.")
+    return text
 
 
 def midi_name(midi: int) -> str:
@@ -199,6 +249,7 @@ def parse_track(
     ticks_per_beat: int,
     track_index: int,
     event_order_start: int,
+    lyric_encoding: str = DEFAULT_LYRIC_ENCODING,
 ) -> tuple[TrackData, list[TempoEvent], list[TimeSignatureEvent], int]:
     del ticks_per_beat
 
@@ -207,6 +258,7 @@ def parse_track(
     running_status: int | None = None
     track_name: str | None = None
     notes: list[RawNote] = []
+    lyrics: list[RawLyric] = []
     tempo_events: list[TempoEvent] = []
     time_signature_events: list[TimeSignatureEvent] = []
     active_notes: dict[tuple[int, int], deque[int]] = {}
@@ -250,6 +302,11 @@ def parse_track(
                 break
             if meta_type == 0x03:
                 track_name = decode_text(payload)
+            elif meta_type == 0x05:
+                reject_if_over_limit(length, MAX_LYRIC_BYTES, "lyric event size")
+                text = decode_lyric(payload, lyric_encoding, abs_ticks)
+                if text:
+                    lyrics.append(RawLyric(abs_ticks, text, event_order))
             elif meta_type == 0x51 and length == 3:
                 microseconds_per_quarter = int.from_bytes(payload, "big")
                 if microseconds_per_quarter <= 0:
@@ -315,10 +372,13 @@ def parse_track(
         joined = ", ".join(pending[:5])
         raise MidiParseError(f"Track {track_index}: unclosed note(s): {joined}.")
 
-    return TrackData(track_name, notes), tempo_events, time_signature_events, event_order
+    return TrackData(track_name, notes, lyrics), tempo_events, time_signature_events, event_order
 
 
-def parse_midi(path: Path) -> tuple[int, list[TrackData], list[TempoEvent], list[TimeSignatureEvent]]:
+def parse_midi(
+    path: Path,
+    lyric_encoding: str = DEFAULT_LYRIC_ENCODING,
+) -> tuple[int, list[TrackData], list[TempoEvent], list[TimeSignatureEvent]]:
     try:
         file_size = path.stat().st_size
     except OSError as exc:
@@ -363,6 +423,7 @@ def parse_midi(path: Path) -> tuple[int, list[TrackData], list[TempoEvent], list
     time_signature_events: list[TimeSignatureEvent] = []
     event_order = 0
     parsed_note_count = 0
+    lyric_byte_count = 0
 
     for track_index in range(track_count):
         chunk_type, offset = read_exact(data, offset, 4, f"track {track_index} chunk type")
@@ -375,12 +436,15 @@ def parse_midi(path: Path) -> tuple[int, list[TrackData], list[TempoEvent], list
             ticks_per_beat,
             track_index,
             event_order,
+            lyric_encoding,
         )
         tracks.append(track)
         parsed_note_count += len(track.notes)
+        lyric_byte_count += sum(len(item.text.encode("utf-8")) for item in track.lyrics)
         tempo_events.extend(track_tempos)
         time_signature_events.extend(track_sigs)
         reject_if_over_limit(parsed_note_count, MAX_PARSED_NOTES, "parsed note count")
+        reject_if_over_limit(lyric_byte_count, MAX_TOTAL_LYRIC_BYTES, "total lyric size")
         reject_if_over_limit(len(tempo_events), MAX_TEMPO_EVENTS, "tempo event count")
         reject_if_over_limit(
             len(time_signature_events),
@@ -408,10 +472,11 @@ def normalize_tempo_map(events: list[TempoEvent], ticks_per_beat: int) -> list[d
     if 0.0 not in by_time:
         by_time[0.0] = 120
 
-    return [
+    timeline = [
         {"time": normalize_number(time), "bpm": bpm}
         for time, bpm in sorted(by_time.items())
     ]
+    return remove_redundant_timeline_values(timeline, ("bpm",))
 
 
 def normalize_time_signature_map(
@@ -425,7 +490,7 @@ def normalize_time_signature_map(
     if 0.0 not in by_time:
         by_time[0.0] = (4, 4)
 
-    return [
+    timeline = [
         {
             "time": normalize_number(time),
             "numerator": numerator,
@@ -433,6 +498,21 @@ def normalize_time_signature_map(
         }
         for time, (numerator, denominator) in sorted(by_time.items())
     ]
+    return remove_redundant_timeline_values(timeline, ("numerator", "denominator"))
+
+
+def remove_redundant_timeline_values(
+    timeline: list[dict[str, Any]],
+    value_keys: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    previous: tuple[Any, ...] | None = None
+    for item in timeline:
+        value = tuple(item[key] for key in value_keys)
+        if value != previous:
+            output.append(item)
+            previous = value
+    return output
 
 
 def build_time_signature_segments(
@@ -525,12 +605,31 @@ def validate_required_track_set(tracks: list[TrackData]) -> None:
         raise MidiValidationError("MIDI must not contain more than one non-empty 'control' track.")
 
 
+def bind_melody_lyrics(track: TrackData, source_path: Path) -> dict[int, str]:
+    notes_by_start: dict[int, list[RawNote]] = {}
+    for note in track.notes:
+        notes_by_start.setdefault(note.start_ticks, []).append(note)
+    lyrics_by_start: dict[int, list[RawLyric]] = {}
+    for lyric in sorted(track.lyrics, key=lambda item: (item.ticks, item.order)):
+        if lyric.ticks not in notes_by_start:
+            raise MidiValidationError(
+                f"Lyric event at tick {lyric.ticks} in {source_path} "
+                "does not match a melody note start."
+            )
+        lyrics_by_start.setdefault(lyric.ticks, []).append(lyric)
+    return {
+        ticks: "".join(item.text for item in items)
+        for ticks, items in lyrics_by_start.items()
+    }
+
+
 def convert_notes(
     raw_notes: list[RawNote],
     ticks_per_beat: int,
     segments: list[TimeSignatureSegment],
     tolerance: float,
     track_label: str,
+    lyrics_by_start: dict[int, str] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     output: list[dict[str, Any]] = []
     filtered = 0
@@ -542,6 +641,12 @@ def convert_notes(
             )
 
         if raw.midi < C0_MIDI or raw.midi > C6_MIDI:
+            if lyrics_by_start and raw.start_ticks in lyrics_by_start:
+                raise MidiValidationError(
+                    f"{track_label}: note {midi_name(raw.midi)} midi={raw.midi} at "
+                    f"tick {raw.start_ticks} has lyric {lyrics_by_start[raw.start_ticks]!r} "
+                    "but would be filtered as out of range."
+                )
             filtered += 1
             continue
 
@@ -562,8 +667,7 @@ def convert_notes(
                 )
 
         bar, beat, grid = bar_position(segments, start)
-        output.append(
-            {
+        note = {
                 "name": midi_name(raw.midi),
                 "midi": raw.midi,
                 "time": normalize_number(start),
@@ -572,7 +676,9 @@ def convert_notes(
                 "beat": beat,
                 "grid": grid,
             }
-        )
+        if lyrics_by_start and raw.start_ticks in lyrics_by_start:
+            note["lyric"] = lyrics_by_start[raw.start_ticks]
+        output.append(note)
 
     return output, filtered
 
@@ -877,8 +983,64 @@ def write_json_files(
             remove_temp_file(temp_path)
 
 
-def output_dir_for_midi(input_path: Path, output_root: Path) -> Path:
-    return output_root / input_path.stem
+def validate_work_name(work_name: str) -> None:
+    if (
+        not work_name
+        or work_name in {".", ".."}
+        or Path(work_name).name != work_name
+        or "/" in work_name
+        or "\\" in work_name
+    ):
+        raise MidiValidationError(
+            "work_name must be one safe directory name without path separators."
+        )
+
+
+def parse_midi_with_path(
+    path: Path,
+    lyric_encoding: str,
+) -> tuple[int, list[TrackData], list[TempoEvent], list[TimeSignatureEvent]]:
+    try:
+        return parse_midi(
+            path,
+            lyric_encoding=lyric_encoding,
+        )
+    except MidiParseError as exc:
+        raise MidiParseError(f"{path}: {exc}") from exc
+
+
+def select_role_track(
+    path: Path,
+    tracks: list[TrackData],
+    role: str,
+) -> tuple[int, TrackData]:
+    non_empty_tracks = [
+        (index, track)
+        for index, track in enumerate(tracks)
+        if track.notes
+    ]
+    if not non_empty_tracks:
+        raise MidiValidationError(
+            f"{path}: no non-empty tracks found for role '{role}'."
+        )
+    if len(non_empty_tracks) == 1:
+        selected_index, selected = non_empty_tracks[0]
+    else:
+        matches = [
+            (index, track)
+            for index, track in non_empty_tracks
+            if track.name is not None and track.name.strip().lower() == role
+        ]
+        if not matches:
+            raise MidiValidationError(
+                f"{path}: multiple non-empty tracks found, but none is named '{role}'."
+            )
+        if len(matches) > 1:
+            raise MidiValidationError(
+                f"{path}: multiple non-empty tracks are named '{role}'."
+            )
+        selected_index, selected = matches[0]
+    return selected_index, selected
 
 
 def output_json_paths(output_dir: Path) -> list[Path]:
@@ -896,44 +1058,45 @@ def require_no_existing_outputs(output_dir: Path) -> None:
         raise MidiValidationError(f"Output JSON file(s) already exist: {joined}")
 
 
-def convert_midi_to_json(
-    input_path: Path,
+def convert_selected_tracks_to_json(
+    melody_track: TrackData,
+    melody_ticks_per_beat: int,
+    melody_path: Path,
+    chord_track: TrackData,
+    chord_ticks_per_beat: int,
+    control_track: TrackData | None,
+    control_ticks_per_beat: int | None,
+    tempo_events: list[TempoEvent],
+    time_signature_events: list[TimeSignatureEvent],
     output_root: Path,
-    tolerance: float,
+    work_name: str,
+    tolerance: float = 0.01,
     overwrite: bool = True,
 ) -> Path:
     validate_tolerance(tolerance)
-    output_dir = output_dir_for_midi(input_path, output_root)
+    validate_work_name(work_name)
+    output_dir = output_root / work_name
     if not overwrite:
         require_no_existing_outputs(output_dir)
 
-    ticks_per_beat, tracks, tempo_events, time_signature_events = parse_midi(input_path)
-    music_tracks = [track for track in tracks if track.notes]
-
-    validate_required_track_set(music_tracks)
-    tracks_by_name = {
-        track.name.strip().lower(): track
-        for track in music_tracks
-        if track.name is not None
-    }
-    melody_track = tracks_by_name["melody"]
-    chord_track = tracks_by_name["chord"]
-    control_track = tracks_by_name.get("control")
-
-    tempo_map = normalize_tempo_map(tempo_events, ticks_per_beat)
-    time_signature_map = normalize_time_signature_map(time_signature_events, ticks_per_beat)
+    tempo_map = normalize_tempo_map(tempo_events, melody_ticks_per_beat)
+    time_signature_map = normalize_time_signature_map(
+        time_signature_events, melody_ticks_per_beat
+    )
     segments = build_time_signature_segments(time_signature_map)
 
+    lyrics_by_start = bind_melody_lyrics(melody_track, melody_path)
     melody_notes, filtered_melody = convert_notes(
         melody_track.notes,
-        ticks_per_beat,
+        melody_ticks_per_beat,
         segments,
         tolerance,
         "melody",
+        lyrics_by_start,
     )
     chord_notes, filtered_chord = convert_notes(
         chord_track.notes,
-        ticks_per_beat,
+        chord_ticks_per_beat,
         segments,
         tolerance,
         "chord",
@@ -960,7 +1123,7 @@ def convert_midi_to_json(
     control_notes = (
         convert_control_notes(
             control_track.notes,
-            ticks_per_beat,
+            int(control_ticks_per_beat),
             segments,
             float(header["duration"]),
             tolerance,
@@ -1001,6 +1164,109 @@ def convert_midi_to_json(
     return output_dir
 
 
+def convert_midi_to_json(
+    input_path: Path,
+    output_root: Path,
+    tolerance: float,
+    overwrite: bool = True,
+    lyric_encoding: str = DEFAULT_LYRIC_ENCODING,
+    work_name: str | None = None,
+) -> Path:
+    validate_tolerance(tolerance)
+    lyric_encoding = normalize_lyric_encoding(lyric_encoding)
+    output_work_name = work_name or input_path.stem
+    validate_work_name(output_work_name)
+    ticks_per_beat, tracks, tempos, time_signatures = parse_midi_with_path(
+        input_path, lyric_encoding
+    )
+    music_tracks = [track for track in tracks if track.notes]
+    validate_required_track_set(music_tracks)
+    tracks_by_name = {
+        track.name.strip().lower(): track
+        for track in music_tracks
+        if track.name is not None
+    }
+    return convert_selected_tracks_to_json(
+        tracks_by_name["melody"],
+        ticks_per_beat,
+        input_path,
+        tracks_by_name["chord"],
+        ticks_per_beat,
+        tracks_by_name.get("control"),
+        ticks_per_beat if "control" in tracks_by_name else None,
+        tempos,
+        time_signatures,
+        output_root,
+        output_work_name,
+        tolerance,
+        overwrite,
+    )
+
+
+def convert_role_midis_to_json(
+    melody_path: Path,
+    chord_path: Path,
+    control_path: Path | None,
+    output_root: Path,
+    work_name: str | None = None,
+    tolerance: float = 0.01,
+    overwrite: bool = True,
+    lyric_encoding: str = DEFAULT_LYRIC_ENCODING,
+) -> Path:
+    validate_tolerance(tolerance)
+    lyric_encoding = normalize_lyric_encoding(lyric_encoding)
+    output_work_name = work_name or melody_path.stem
+    validate_work_name(output_work_name)
+    paths = [melody_path, chord_path] + ([control_path] if control_path else [])
+    parsed_by_path: dict[
+        Path,
+        tuple[int, list[TrackData], list[TempoEvent], list[TimeSignatureEvent]],
+    ] = {}
+    for path in paths:
+        resolved = path.expanduser().resolve()
+        if resolved not in parsed_by_path:
+            parsed_by_path[resolved] = parse_midi_with_path(path, lyric_encoding)
+
+    selected: dict[str, tuple[Path, int, TrackData, int]] = {}
+    for role, path in (
+        ("melody", melody_path),
+        ("chord", chord_path),
+        ("control", control_path),
+    ):
+        if path is None:
+            continue
+        resolved = path.expanduser().resolve()
+        ticks_per_beat, tracks, _, _ = parsed_by_path[resolved]
+        track_index, track = select_role_track(path, tracks, role)
+        selected[role] = (resolved, track_index, track, ticks_per_beat)
+
+    identities = [(item[0], item[1]) for item in selected.values()]
+    if len(set(identities)) != len(identities):
+        raise MidiValidationError(
+            "The same MIDI track cannot be selected for more than one role."
+        )
+
+    melody_resolved, _, melody_track, melody_tpb = selected["melody"]
+    _, _, chord_track, chord_tpb = selected["chord"]
+    control_selected = selected.get("control")
+    _, _, tempos, time_signatures = parsed_by_path[melody_resolved]
+    return convert_selected_tracks_to_json(
+        melody_track,
+        melody_tpb,
+        melody_path,
+        chord_track,
+        chord_tpb,
+        control_selected[2] if control_selected else None,
+        control_selected[3] if control_selected else None,
+        tempos,
+        time_signatures,
+        output_root,
+        output_work_name,
+        tolerance,
+        overwrite,
+    )
+
+
 def confirm_overwrite(paths: list[Path]) -> bool:
     joined = "\n".join(str(path) for path in paths)
     try:
@@ -1012,9 +1278,23 @@ def confirm_overwrite(paths: list[Path]) -> bool:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert a melody/chord MIDI file to canonical JSON."
+        description="Convert MIDI melody/chord/control tracks to canonical JSON."
     )
-    parser.add_argument("input_midi", help="Input MIDI file containing melody and chord tracks.")
+    parser.add_argument(
+        "input_midi",
+        nargs="?",
+        help="Single MIDI file containing named melody/chord and optional control tracks.",
+    )
+    parser.add_argument("--melody", help="MIDI file providing the melody track.")
+    parser.add_argument("--chord", help="MIDI file providing the chord track.")
+    parser.add_argument("--control", help="Optional MIDI file providing the control track.")
+    parser.add_argument("--work-name", help="Safe output project directory name.")
+    parser.add_argument(
+        "--lyric-encoding",
+        default=DEFAULT_LYRIC_ENCODING,
+        choices=ALLOWED_LYRIC_ENCODINGS,
+        help="Encoding used by MIDI lyric events. Default: utf-8",
+    )
     parser.add_argument(
         "--output-root",
         default="output",
@@ -1030,22 +1310,55 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
-    input_path = Path(args.input_midi).expanduser()
+    args = parse_args(argv if argv is not None else sys.argv[1:])
     output_root = Path(args.output_root).expanduser()
-
-    try:
-        if not input_path.exists():
-            print(f"ERROR: Input MIDI file does not exist: {input_path}", file=sys.stderr)
-            return 2
-        if not input_path.is_file():
-            print(f"ERROR: Input MIDI path is not a file: {input_path}", file=sys.stderr)
-            return 2
-    except OSError as exc:
-        print(f"ERROR: Unable to inspect input MIDI file {input_path}: {exc}", file=sys.stderr)
+    role_mode = any((args.melody, args.chord, args.control))
+    if role_mode and args.input_midi:
+        print(
+            "ERROR: Positional input_midi cannot be used with --melody, --chord, or --control.",
+            file=sys.stderr,
+        )
+        return 2
+    if role_mode and (not args.melody or not args.chord):
+        print(
+            "ERROR: Role input mode requires both --melody and --chord; --control is optional.",
+            file=sys.stderr,
+        )
+        return 2
+    if not role_mode and not args.input_midi:
+        print(
+            "ERROR: Provide input_midi, or use both --melody and --chord.",
+            file=sys.stderr,
+        )
         return 2
 
-    output_dir = output_dir_for_midi(input_path, output_root)
+    input_paths = (
+        [Path(args.melody).expanduser(), Path(args.chord).expanduser()]
+        + ([Path(args.control).expanduser()] if args.control else [])
+        if role_mode
+        else [Path(args.input_midi).expanduser()]
+    )
+    for input_path in dict.fromkeys(input_paths):
+        try:
+            if not input_path.exists():
+                print(f"ERROR: Input MIDI file does not exist: {input_path}", file=sys.stderr)
+                return 2
+            if not input_path.is_file():
+                print(f"ERROR: Input MIDI path is not a file: {input_path}", file=sys.stderr)
+                return 2
+        except OSError as exc:
+            print(f"ERROR: Unable to inspect input MIDI file {input_path}: {exc}", file=sys.stderr)
+            return 2
+
+    default_name_path = Path(args.melody).expanduser() if role_mode else input_paths[0]
+    output_work_name = args.work_name or default_name_path.stem
+    try:
+        validate_work_name(output_work_name)
+        validate_tolerance(args.tolerance)
+    except MidiValidationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    output_dir = output_root / output_work_name
     try:
         existing_outputs = existing_output_json_paths(output_dir)
     except OSError as exc:
@@ -1056,12 +1369,26 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        output_dir = convert_midi_to_json(
-            input_path,
-            output_root,
-            args.tolerance,
-            overwrite=bool(existing_outputs),
-        )
+        if not role_mode:
+            output_dir = convert_midi_to_json(
+                input_paths[0],
+                output_root,
+                args.tolerance,
+                overwrite=bool(existing_outputs),
+                lyric_encoding=args.lyric_encoding,
+                work_name=args.work_name,
+            )
+        else:
+            output_dir = convert_role_midis_to_json(
+                Path(args.melody).expanduser(),
+                Path(args.chord).expanduser(),
+                Path(args.control).expanduser() if args.control else None,
+                output_root,
+                args.work_name,
+                args.tolerance,
+                overwrite=bool(existing_outputs),
+                lyric_encoding=args.lyric_encoding,
+            )
     except (MidiParseError, MidiValidationError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

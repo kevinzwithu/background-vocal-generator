@@ -76,11 +76,11 @@ def track_chunk(
     return b"MTrk" + len(payload).to_bytes(4, "big") + bytes(payload)
 
 
-def midi_file(tracks: list[bytes], midi_format: int = 1) -> bytes:
+def midi_file(tracks: list[bytes], midi_format: int = 1, ticks_per_beat: int = TICKS_PER_BEAT) -> bytes:
     header_payload = (
         midi_format.to_bytes(2, "big")
         + len(tracks).to_bytes(2, "big")
-        + TICKS_PER_BEAT.to_bytes(2, "big")
+        + ticks_per_beat.to_bytes(2, "big")
     )
     return b"MThd" + len(header_payload).to_bytes(4, "big") + header_payload + b"".join(tracks)
 
@@ -1246,6 +1246,360 @@ class MidiToJsonTest(unittest.TestCase):
                 },
             ],
         )
+
+
+class RoleMidiAndLyricsTest(unittest.TestCase):
+    def test_selects_single_track_role_files_with_different_ticks_per_beat(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            melody_path = root / "melody.mid"
+            chord_path = root / "chord.mid"
+            melody_path.write_bytes(midi_file([track_chunk("voice", [(0, 480, 60)])]))
+            chord_path.write_bytes(
+                midi_file(
+                    [track_chunk("harmony", [(0, 960, 48), (0, 960, 52)])],
+                    ticks_per_beat=960,
+                )
+            )
+
+            output = midi_to_json.convert_role_midis_to_json(
+                melody_path, chord_path, None, root / "output", "song"
+            )
+            canonical = json.loads((output / "canonical.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(canonical["header"]["duration"], 1)
+        self.assertEqual(len(canonical["melody"]), 1)
+        self.assertEqual(len(canonical["chord"]), 2)
+
+    def test_ignores_empty_tracks_before_selecting_single_role_track(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            melody_path = root / "melody.mid"
+            chord_path = root / "chord.mid"
+            melody_path.write_bytes(
+                midi_file(
+                    [
+                        track_chunk("conductor", []),
+                        track_chunk("voice", [(0, 480, 60)]),
+                        track_chunk("empty", []),
+                    ]
+                )
+            )
+            chord_path.write_bytes(
+                midi_file(
+                    [
+                        track_chunk("empty", []),
+                        track_chunk("harmony", [(0, 480, 48), (0, 480, 52)]),
+                    ]
+                )
+            )
+
+            output = midi_to_json.convert_role_midis_to_json(
+                melody_path, chord_path, None, root / "output"
+            )
+            canonical = json.loads((output / "canonical.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(canonical["melody"]), 1)
+        self.assertEqual(len(canonical["chord"]), 2)
+
+    def test_uses_only_melody_file_header(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            melody_path = root / "melody.mid"
+            chord_path = root / "chord.mid"
+            melody_path.write_bytes(
+                midi_file([track_chunk("melody", [(0, 480, 60)], [(0, 0x51, tempo_payload(120))])])
+            )
+            chord_path.write_bytes(
+                midi_file(
+                    [track_chunk("chord", [(0, 480, 48), (0, 480, 52)], [(0, 0x51, tempo_payload(122))])]
+                )
+            )
+
+            output = midi_to_json.convert_role_midis_to_json(
+                melody_path, chord_path, None, root / "output"
+            )
+            canonical = json.loads((output / "canonical.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(canonical["header"]["tempoMap"], [{"time": 0, "bpm": 120}])
+
+    def test_selects_named_roles_from_shared_multi_track_file(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            melody_path = root / "melody.mid"
+            accompaniment_path = root / "accompaniment.mid"
+            melody_path.write_bytes(
+                midi_file(
+                    [
+                        track_chunk("conductor", []),
+                        track_chunk("melody", [(0, 960, 60)]),
+                    ],
+                    ticks_per_beat=960,
+                )
+            )
+            accompaniment_path.write_bytes(
+                midi_file(
+                    [
+                        track_chunk("chord", [(0, 480, 48), (0, 480, 52)]),
+                        track_chunk("control", [(0, 480, 2)]),
+                    ]
+                )
+            )
+
+            output = midi_to_json.convert_role_midis_to_json(
+                melody_path,
+                accompaniment_path,
+                accompaniment_path,
+                root / "output",
+            )
+            canonical = json.loads((output / "canonical.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(canonical["header"]["duration"], 1)
+        self.assertEqual(canonical["control"][0]["section"], "chorus")
+
+    def test_rejects_missing_named_role_in_multi_track_file(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            melody_path = root / "melody.mid"
+            chord_path = root / "chord.mid"
+            melody_path.write_bytes(
+                midi_file(
+                    [
+                        track_chunk("voice", [(0, 480, 60)]),
+                        track_chunk("other", [(0, 480, 62)]),
+                    ]
+                )
+            )
+            chord_path.write_bytes(
+                midi_file(
+                    [
+                        track_chunk("chord", [(0, 480, 48), (0, 480, 52)]),
+                    ]
+                )
+            )
+
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "none is named 'melody'"):
+                midi_to_json.convert_role_midis_to_json(
+                    melody_path, chord_path, None, root / "output"
+                )
+
+    def test_rejects_duplicate_or_empty_selected_role_track(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            melody_path = root / "melody.mid"
+            duplicate_chord_path = root / "duplicate-chord.mid"
+            empty_chord_path = root / "empty-chord.mid"
+            melody_path.write_bytes(midi_file([track_chunk("melody", [(0, 480, 60)])]))
+            duplicate_chord_path.write_bytes(
+                midi_file(
+                    [
+                        track_chunk("chord", [(0, 480, 48), (0, 480, 52)]),
+                        track_chunk("chord", [(0, 480, 55), (0, 480, 59)]),
+                    ]
+                )
+            )
+            empty_chord_path.write_bytes(
+                midi_file([track_chunk("chord", []), track_chunk("other", [])])
+            )
+
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "multiple non-empty tracks are named"):
+                midi_to_json.convert_role_midis_to_json(
+                    melody_path, duplicate_chord_path, None, root / "duplicate-output"
+                )
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "no non-empty tracks"):
+                midi_to_json.convert_role_midis_to_json(
+                    melody_path, empty_chord_path, None, root / "empty-output"
+                )
+
+    def test_rejects_same_single_track_for_multiple_roles(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            melody_path = root / "melody.mid"
+            shared_path = root / "shared.mid"
+            melody_path.write_bytes(midi_file([track_chunk("melody", [(0, 480, 60)])]))
+            shared_path.write_bytes(
+                midi_file([track_chunk("shared", [(0, 480, 48), (0, 480, 52)])])
+            )
+
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "same MIDI track"):
+                midi_to_json.convert_role_midis_to_json(
+                    melody_path, shared_path, shared_path, root / "output"
+                )
+
+    def test_role_mode_reuses_same_file_parse(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            melody_path = root / "melody.mid"
+            shared_path = root / "shared.mid"
+            melody_path.write_bytes(midi_file([track_chunk("melody", [(0, 480, 60)])]))
+            shared_path.write_bytes(
+                midi_file(
+                    [
+                        track_chunk("chord", [(0, 480, 48), (0, 480, 52)]),
+                        track_chunk("control", [(0, 480, 2)]),
+                    ]
+                )
+            )
+
+            with patch.object(
+                midi_to_json,
+                "parse_midi_with_path",
+                wraps=midi_to_json.parse_midi_with_path,
+            ) as parse:
+                midi_to_json.convert_role_midis_to_json(
+                    melody_path, shared_path, shared_path, root / "output"
+                )
+
+        self.assertEqual(parse.call_count, 2)
+
+    def test_main_rejects_incomplete_or_mixed_role_arguments(self) -> None:
+        cases = [
+            (["song.mid", "--melody", "melody.mid", "--chord", "chord.mid"], "cannot be used"),
+            (["--melody", "melody.mid"], "requires both"),
+            (["--control", "control.mid"], "requires both"),
+            ([], "Provide input_midi"),
+        ]
+        for argv, message in cases:
+            with self.subTest(argv=argv):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    result = midi_to_json.main(argv)
+                self.assertEqual(result, 2)
+                self.assertIn(message, stderr.getvalue())
+
+    def test_main_accepts_role_arguments(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            melody_path = root / "melody.mid"
+            chord_path = root / "chord.mid"
+            melody_path.write_bytes(midi_file([track_chunk("voice", [(0, 480, 60)])]))
+            chord_path.write_bytes(
+                midi_file([track_chunk("harmony", [(0, 480, 48), (0, 480, 52)])])
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                result = midi_to_json.main(
+                    [
+                        "--melody",
+                        str(melody_path),
+                        "--chord",
+                        str(chord_path),
+                        "--output-root",
+                        str(root / "output"),
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        self.assertIn("Wrote JSON files", stdout.getvalue())
+
+    def test_main_rejects_unsafe_work_name_before_inspecting_outputs(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "song.mid"
+            input_path.write_bytes(
+                midi_file(
+                    [
+                        track_chunk("melody", [(0, 480, 60)]),
+                        track_chunk("chord", [(0, 480, 48), (0, 480, 52)]),
+                    ]
+                )
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(midi_to_json, "existing_output_json_paths") as inspect_outputs,
+                redirect_stderr(stderr),
+            ):
+                result = midi_to_json.main(
+                    [
+                        str(input_path),
+                        "--work-name",
+                        "../escape",
+                        "--output-root",
+                        str(root / "output"),
+                    ]
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("work_name must be one safe directory name", stderr.getvalue())
+        inspect_outputs.assert_not_called()
+
+    def test_parses_and_concatenates_melody_lyrics(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [(0, 480, 60)],
+                    [(0, 0x05, b"Hel"), (0, 0x05, b"lo")],
+                ),
+                track_chunk("chord", [(0, 480, 48), (0, 480, 52)]),
+            ]
+        )
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "song.mid"
+            path.write_bytes(midi_bytes)
+            output = midi_to_json.convert_midi_to_json(path, root / "output", 0.01)
+            canonical = json.loads((output / "canonical.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(canonical["melody"][0]["lyric"], "Hello")
+
+    def test_preserves_utf8_chinese_lyrics(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [(0, 480, 60)],
+                    [(0, 0x05, "见面是最棒的事".encode("utf-8"))],
+                ),
+                track_chunk("chord", [(0, 480, 48), (0, 480, 52)]),
+            ]
+        )
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "song.mid"
+            path.write_bytes(midi_bytes)
+            output = midi_to_json.convert_midi_to_json(path, root / "output", 0.01)
+            canonical = json.loads((output / "canonical.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(canonical["melody"][0]["lyric"], "见面是最棒的事")
+
+    def test_requires_explicit_encoding_for_legacy_chinese_lyrics(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk(
+                    "melody",
+                    [(0, 480, 60)],
+                    [(0, 0x05, "你好".encode("gb18030"))],
+                ),
+                track_chunk("chord", [(0, 480, 48), (0, 480, 52)]),
+            ]
+        )
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "song.mid"
+            path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiParseError, "not valid utf-8"):
+                midi_to_json.convert_midi_to_json(path, root / "default", 0.01)
+            output = midi_to_json.convert_midi_to_json(
+                path, root / "explicit", 0.01, lyric_encoding="gb18030"
+            )
+            canonical = json.loads((output / "canonical.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(canonical["melody"][0]["lyric"], "你好")
+
+    def test_rejects_orphan_melody_lyric(self) -> None:
+        midi_bytes = midi_file(
+            [
+                track_chunk("melody", [(0, 480, 60)], [(240, 0x05, b"orphan")]),
+                track_chunk("chord", [(0, 480, 48), (0, 480, 52)]),
+            ]
+        )
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "song.mid"
+            path.write_bytes(midi_bytes)
+            with self.assertRaisesRegex(midi_to_json.MidiValidationError, "does not match"):
+                midi_to_json.convert_midi_to_json(path, root / "output", 0.01)
 
 
 if __name__ == "__main__":
