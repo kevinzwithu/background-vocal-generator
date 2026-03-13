@@ -25,13 +25,11 @@ except ModuleNotFoundError:
 
 BASE_NOTE_KEYS = {"name", "midi", "time", "duration"}
 NON_PAD_NOTE_KEYS = BASE_NOTE_KEYS | {"lyric"}
-PAD_NOTE_KEYS = BASE_NOTE_KEYS
 MAX_NOTE_TXT_FILE_BYTES = 100 * 1024
 MAX_BARS = project_common.MAX_BARS
 MAX_SECONDS = project_common.MAX_SECONDS
 MELODY_ALIGNED_TRACKS = ("HHA", "HHB", "HHF", "LHA", "LHB", "LHF")
 CONTOUR_TRACKS = ("HHA", "HHB", "LHA", "LHB")
-EXPRESSIVE_HARMONY_TRACKS = ("HHA", "HHB", "LHA", "LHB")
 HIGH_TRACKS = ("HHA", "HHB", "HHF")
 LOW_TRACKS = ("LHA", "LHB", "LHF")
 PAD_TRACKS = ("VocalPad1", "VocalPad2", "VocalPad3", "VocalPad4")
@@ -132,17 +130,11 @@ def resolve_bv_path(path: Path) -> Path:
     return path
 
 
-def read_json(path: Path) -> dict[str, Any]:
-    return bv_raw_to_midi.read_json(path)
-
-
 def source_payload(bv_path: Path) -> dict[str, Any]:
     for name in ("melody.json", "canonical.json"):
         candidate = bv_path.parent / name
         if candidate.exists():
-            payload = read_json(candidate)
-            if not isinstance(payload, dict):
-                raise ValueError(f"Source JSON root must be an object: {candidate}")
+            payload = bv_raw_to_midi.read_json(candidate)
             if not isinstance(payload.get("melody"), list):
                 raise ValueError(f"Source JSON must contain a melody list: {candidate}")
             bv_raw_to_midi.reject_if_over_limit(
@@ -189,7 +181,7 @@ def hard_validate(bv_path: Path) -> tuple[dict[str, Any] | None, list[str]]:
     for track_name, notes in tracks.items():
         for index, note in enumerate(notes):
             keys = set(note.keys())
-            allowed_keys = PAD_NOTE_KEYS if track_name in PAD_TRACKS else NON_PAD_NOTE_KEYS
+            allowed_keys = BASE_NOTE_KEYS if track_name in PAD_TRACKS else NON_PAD_NOTE_KEYS
             if not BASE_NOTE_KEYS.issubset(keys) or not keys.issubset(allowed_keys):
                 errors.append(
                     f"{track_name}[{index}] must contain only allowed fields including "
@@ -275,13 +267,6 @@ def build_time_signature_segments(header: dict[str, Any]) -> list[TimeSignatureS
     return segments
 
 
-def segment_for_time(
-    segments: list[TimeSignatureSegment],
-    time: float,
-) -> TimeSignatureSegment:
-    return project_common.segment_for_time(segments, time)
-
-
 def segment_for_bar(
     segments: list[TimeSignatureSegment],
     bar: int,
@@ -296,7 +281,7 @@ def segment_for_bar(
 
 
 def bar_key(time: float, segments: list[TimeSignatureSegment]) -> int:
-    segment = segment_for_time(segments, time)
+    segment = project_common.segment_for_time(segments, time)
     offset = max(0.0, time - segment.start)
     return segment.start_bar + int(offset // segment.bar_length)
 
@@ -326,10 +311,7 @@ def chord_pitch_classes(chord_name: str) -> set[int] | None:
 
 
 def expected_bar_count(header: dict[str, Any], segments: list[TimeSignatureSegment]) -> int:
-    duration = float(header["duration"])
-    if duration <= 0:
-        return 0
-    return project_common.count_bars(duration, segments)
+    return project_common.count_bars(float(header["duration"]), segments)
 
 
 def read_note_text(note_txt: Path) -> str:
@@ -457,7 +439,6 @@ def chord_events(note_txt: Path, header: dict[str, Any]) -> list[tuple[float, se
                 )
             chord = match.group(2).strip()
             time = bar_beat_to_time(bar, beat, segments)
-            duration = float(header.get("duration", 0))
             if time < 0 or time >= duration:
                 raise ValueError(
                     f"note.txt chord event at bar {bar} beat {beat:g} "
@@ -528,7 +509,7 @@ def is_phrase_boundary(
         return True
     if section_at(control, float(previous["time"])) != section_at(control, current_time):
         return True
-    segment = segment_for_time(segments, current_time)
+    segment = project_common.segment_for_time(segments, current_time)
     offset = max(0.0, current_time - segment.start)
     remainder = offset % segment.bar_length
     return min(remainder, segment.bar_length - remainder) <= 1e-9
@@ -789,7 +770,7 @@ def score_arrangement(
                 warnings.append(f"{track_name} sits more than an octave below melody on {wide} notes.")
                 deductions += min(6, wide)
 
-        for track_name in EXPRESSIVE_HARMONY_TRACKS:
+        for track_name in CONTOUR_TRACKS:
             outside_preferred = sum(
                 1
                 for melody_note, harmony_note in zip(harmony_melody, tracks[track_name])
@@ -816,24 +797,23 @@ def score_arrangement(
 
     events = chord_events(bv_path.parent / "note.txt", header)
     chord_misses = 0
-    if events:
-        for track_name in (*MELODY_ALIGNED_TRACKS, *PAD_TRACKS):
-            for note in tracks[track_name]:
-                chord = active_chord(events, float(note["time"]))
-                if chord is None:
-                    continue
-                pcs, chord_name = chord
-                if pcs is not None and int(note["midi"]) % 12 not in pcs:
-                    chord_misses += 1
-                    if chord_misses <= 12:
-                        warnings.append(
-                            f"{track_name} note {note['name']} at {note['time']} is outside {chord_name}."
-                        )
-        if chord_misses:
-            suggestions.append(
-                "Review non-chord tones. Keep intentional tensions, but correct accidental misses."
-            )
-            deductions += min(15, chord_misses)
+    for track_name in (*MELODY_ALIGNED_TRACKS, *PAD_TRACKS):
+        for note in tracks[track_name]:
+            chord = active_chord(events, float(note["time"]))
+            if chord is None:
+                continue
+            pcs, chord_name = chord
+            if pcs is not None and int(note["midi"]) % 12 not in pcs:
+                chord_misses += 1
+                if chord_misses <= 12:
+                    warnings.append(
+                        f"{track_name} note {note['name']} at {note['time']} is outside {chord_name}."
+                    )
+    if chord_misses:
+        suggestions.append(
+            "Review non-chord tones. Keep intentional tensions, but correct accidental misses."
+        )
+        deductions += min(15, chord_misses)
 
     if not warnings:
         suggestions.append("No soft music issues detected by the current heuristic checks.")

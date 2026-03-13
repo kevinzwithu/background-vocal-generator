@@ -264,8 +264,7 @@ def validate_source_requirement(
 
 
 def resolve_header(payload: dict[str, Any], bv_path: Path) -> dict[str, Any]:
-    header: dict[str, Any] = {}
-    header.update(sibling_header(bv_path))
+    header = sibling_header(bv_path)
 
     raw_header = payload.get("header")
     if isinstance(raw_header, dict):
@@ -385,16 +384,12 @@ def build_time_signature_segments(header: dict[str, Any]) -> list[TimeSignatureS
     return segments
 
 
-def segment_for_time(segments: list[TimeSignatureSegment], time: float) -> TimeSignatureSegment:
-    return project_common.segment_for_time(segments, time)
-
-
 def quantized(
     segments: list[TimeSignatureSegment],
     time: float,
     tolerance: float,
 ) -> tuple[bool, float, TimeSignatureSegment]:
-    segment = segment_for_time(segments, time)
+    segment = project_common.segment_for_time(segments, time)
     offset = time - segment.start
     ok, nearest_offset = project_common.snap_to_music_grid(
         offset,

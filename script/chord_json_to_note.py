@@ -166,7 +166,7 @@ def validate_header(payload: dict[str, Any]) -> dict[str, Any]:
     for map_name in ("tempoMap", "timeSignatureMap"):
         for item in header[map_name]:
             event_time = float(item["time"])
-            if event_time >= duration and event_time > EPSILON:
+            if event_time >= duration:
                 raise ChordChartError(
                     f"{map_name} event at time={format_number(event_time)} "
                     "must occur before header.duration."
@@ -255,12 +255,8 @@ def build_segments(header: dict[str, Any]) -> list[TimeSignatureSegment]:
     return segments
 
 
-def segment_for_time(segments: list[TimeSignatureSegment], time: float) -> TimeSignatureSegment:
-    return project_common.segment_for_time(segments, time)
-
-
 def bar_and_beat(segments: list[TimeSignatureSegment], time: float) -> tuple[int, float]:
-    segment = segment_for_time(segments, time)
+    segment = project_common.segment_for_time(segments, time)
     offset = time - segment.start
     bar_offset = math.floor((offset + EPSILON) / segment.bar_length)
     beat = offset - bar_offset * segment.bar_length + 1

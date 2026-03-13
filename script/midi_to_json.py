@@ -135,12 +135,10 @@ def read_var_len(data: bytes, offset: int) -> tuple[int, int]:
 
 
 def decode_text(raw: bytes) -> str:
-    for encoding in ("utf-8", "latin-1"):
-        try:
-            return raw.decode(encoding).strip()
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace").strip()
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return raw.decode("latin-1").strip()
 
 
 def normalize_lyric_encoding(encoding: str) -> str:
@@ -155,7 +153,7 @@ def normalize_lyric_encoding(encoding: str) -> str:
         "iso8859-1": "latin-1",
     }
     selected = aliases.get(normalized)
-    if selected is None or selected not in ALLOWED_LYRIC_ENCODINGS:
+    if selected is None:
         raise MidiValidationError(
             "lyric_encoding must be one of: " + ", ".join(ALLOWED_LYRIC_ENCODINGS) + "."
         )
@@ -317,7 +315,7 @@ def parse_track(
             elif meta_type == 0x58 and length >= 2:
                 numerator = payload[0]
                 denominator = 2 ** payload[1]
-                if numerator <= 0 or denominator <= 0:
+                if numerator <= 0:
                     raise MidiParseError(f"Track {track_index}: invalid time signature event.")
                 time_signature_events.append(
                     TimeSignatureEvent(abs_ticks, numerator, denominator, event_order)
@@ -554,16 +552,12 @@ def build_time_signature_segments(
     return segments
 
 
-def segment_for_time(segments: list[TimeSignatureSegment], time: float) -> TimeSignatureSegment:
-    return project_common.segment_for_time(segments, time)
-
-
 def quantization_details(
     segments: list[TimeSignatureSegment],
     time: float,
     tolerance: float,
 ) -> tuple[bool, TimeSignatureSegment, float]:
-    segment = segment_for_time(segments, time)
+    segment = project_common.segment_for_time(segments, time)
     offset = time - segment.start
     ok, nearest_offset = project_common.snap_to_music_grid(
         offset,
@@ -575,7 +569,7 @@ def quantization_details(
 
 
 def bar_position(segments: list[TimeSignatureSegment], time: float) -> tuple[int, int | float, int]:
-    segment = segment_for_time(segments, time)
+    segment = project_common.segment_for_time(segments, time)
     offset = max(0.0, time - segment.start)
     bar_offset = math.floor((offset + 1e-9) / segment.bar_length)
     bar_start = segment.start + bar_offset * segment.bar_length
@@ -606,12 +600,10 @@ def validate_required_track_set(tracks: list[TrackData]) -> None:
 
 
 def bind_melody_lyrics(track: TrackData, source_path: Path) -> dict[int, str]:
-    notes_by_start: dict[int, list[RawNote]] = {}
-    for note in track.notes:
-        notes_by_start.setdefault(note.start_ticks, []).append(note)
+    note_starts = {note.start_ticks for note in track.notes}
     lyrics_by_start: dict[int, list[RawLyric]] = {}
     for lyric in sorted(track.lyrics, key=lambda item: (item.ticks, item.order)):
-        if lyric.ticks not in notes_by_start:
+        if lyric.ticks not in note_starts:
             raise MidiValidationError(
                 f"Lyric event at tick {lyric.ticks} in {source_path} "
                 "does not match a melody note start."
@@ -821,9 +813,10 @@ def group_notes_by_start(
     tolerance: float,
 ) -> list[list[dict[str, Any]]]:
     grouped_notes: dict[float, list[dict[str, Any]]] = {}
+    grouping_tolerance = max(tolerance, 1e-9)
     for note in notes:
         start = float(note["time"])
-        key = round(start / max(tolerance, 1e-9)) * max(tolerance, 1e-9)
+        key = round(start / grouping_tolerance) * grouping_tolerance
         grouped_notes.setdefault(key, []).append(note)
     return [grouped_notes[key] for key in sorted(grouped_notes)]
 
@@ -986,9 +979,7 @@ def write_json_files(
 def validate_work_name(work_name: str) -> None:
     if (
         not work_name
-        or work_name in {".", ".."}
         or Path(work_name).name != work_name
-        or "/" in work_name
         or "\\" in work_name
     ):
         raise MidiValidationError(
@@ -1001,10 +992,7 @@ def parse_midi_with_path(
     lyric_encoding: str,
 ) -> tuple[int, list[TrackData], list[TempoEvent], list[TimeSignatureEvent]]:
     try:
-        return parse_midi(
-            path,
-            lyric_encoding=lyric_encoding,
-        )
+        return parse_midi(path, lyric_encoding=lyric_encoding)
     except MidiParseError as exc:
         raise MidiParseError(f"{path}: {exc}") from exc
 
@@ -1107,17 +1095,18 @@ def convert_selected_tracks_to_json(
     chord_notes = filter_non_chord_groups(chord_notes, tolerance)
 
     header = build_header(melody_notes, chord_notes, tempo_map, time_signature_map)
+    duration = float(header["duration"])
     validate_header_events_within_duration(
         tempo_map,
         time_signature_map,
-        float(header["duration"]),
+        duration,
     )
     validate_piece_limits(
         melody_notes,
         chord_notes,
         tempo_map,
         segments,
-        float(header["duration"]),
+        duration,
         tolerance,
     )
     control_notes = (
@@ -1125,7 +1114,7 @@ def convert_selected_tracks_to_json(
             control_track.notes,
             int(control_ticks_per_beat),
             segments,
-            float(header["duration"]),
+            duration,
             tolerance,
         )
         if control_track is not None
