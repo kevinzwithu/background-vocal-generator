@@ -13,6 +13,21 @@ class Segment:
 
 
 class ProjectCommonTest(unittest.TestCase):
+    def test_time_signature_changes_share_bar_and_grid_calculations(self) -> None:
+        segments = project_common.build_time_signature_segments([
+            {"time": 0, "numerator": 3, "denominator": 4},
+            {"time": 6, "numerator": 6, "denominator": 8},
+        ])
+        self.assertEqual([segment.start_bar for segment in segments], [1, 3])
+        self.assertEqual(project_common.bar_and_beat(segments, 6), (3, 1))
+        self.assertEqual(project_common.bar_and_beat(segments, 10.5), (4, 2.5))
+        self.assertEqual(segments[1].grid_size, 3 / 32)
+        with self.assertRaisesRegex(ValueError, "previous bar boundary"):
+            project_common.build_time_signature_segments([
+                {"time": 0, "numerator": 4, "denominator": 4},
+                {"time": 3, "numerator": 3, "denominator": 4},
+            ])
+
     def test_validates_tolerance_boundaries(self) -> None:
         for value in (0, 0.01, project_common.MAX_TOLERANCE):
             with self.subTest(value=value):

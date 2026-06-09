@@ -70,13 +70,7 @@ class ChordChartError(Exception):
     pass
 
 
-@dataclass(frozen=True)
-class TimeSignatureSegment:
-    start: float
-    numerator: int
-    denominator: int
-    bar_length: float
-    start_bar: int
+TimeSignatureSegment = project_common.TimeSignatureSegment
 
 
 @dataclass(frozen=True)
@@ -232,35 +226,13 @@ def validate_time_signature_map(time_signature_map: Any) -> None:
 
 
 def build_segments(header: dict[str, Any]) -> list[TimeSignatureSegment]:
-    segments: list[TimeSignatureSegment] = []
-    start_bar = 1
-    for index, item in enumerate(header["timeSignatureMap"]):
-        start = float(item["time"])
-        numerator = int(item["numerator"])
-        denominator = int(item["denominator"])
-        bar_length = numerator * 4 / denominator
-        if index:
-            previous = segments[-1]
-            bars_elapsed = (start - previous.start) / previous.bar_length
-            rounded = round(bars_elapsed)
-            if abs(bars_elapsed - rounded) > 1e-6:
-                raise ChordChartError(
-                    "Time signature change is not aligned to a bar boundary: "
-                    f"time={normalize_number(start)}."
-                )
-            start_bar = previous.start_bar + rounded
-        segments.append(
-            TimeSignatureSegment(start, numerator, denominator, bar_length, start_bar)
-        )
-    return segments
+    try:
+        return project_common.build_time_signature_segments(header["timeSignatureMap"])
+    except ValueError as exc:
+        raise ChordChartError(str(exc)) from exc
 
 
-def bar_and_beat(segments: list[TimeSignatureSegment], time: float) -> tuple[int, float]:
-    segment = project_common.segment_for_time(segments, time)
-    offset = time - segment.start
-    bar_offset = math.floor((offset + EPSILON) / segment.bar_length)
-    beat = offset - bar_offset * segment.bar_length + 1
-    return segment.start_bar + bar_offset, beat
+bar_and_beat = project_common.bar_and_beat
 
 
 def format_number(value: float | int) -> str:

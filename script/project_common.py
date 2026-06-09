@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any, Protocol, Sequence, TypeVar
 
 
@@ -24,6 +25,52 @@ class TimelineSegment(Protocol):
 
 
 Segment = TypeVar("Segment", bound=TimelineSegment)
+
+
+@dataclass(frozen=True)
+class TimeSignatureSegment:
+    start: float
+    numerator: int
+    denominator: int
+    bar_length: float
+    grid_size: float
+    start_bar: int
+
+
+def build_time_signature_segments(
+    time_signature_map: list[dict[str, Any]],
+) -> list[TimeSignatureSegment]:
+    segments: list[TimeSignatureSegment] = []
+    start_bar = 1
+    for item in time_signature_map:
+        start = float(item["time"])
+        numerator = int(item["numerator"])
+        denominator = int(item["denominator"])
+        bar_length = numerator * 4 / denominator
+        if segments:
+            previous = segments[-1]
+            elapsed_bars = (start - previous.start) / previous.bar_length
+            rounded = round(elapsed_bars)
+            if abs(elapsed_bars - rounded) > 1e-6:
+                raise ValueError(
+                    "Time signature change is not aligned to the previous bar boundary: "
+                    f"time={normalize_number(start)} beats."
+                )
+            start_bar = previous.start_bar + rounded
+        segments.append(TimeSignatureSegment(
+            start, numerator, denominator, bar_length,
+            straight_grid_size_beats(bar_length), start_bar,
+        ))
+    return segments
+
+
+def bar_and_beat(
+    segments: Sequence[TimeSignatureSegment], time: float,
+) -> tuple[int, float]:
+    segment = segment_for_time(segments, time)
+    offset = max(0.0, time - segment.start)
+    bar_offset = math.floor((offset + EPSILON) / segment.bar_length)
+    return segment.start_bar + bar_offset, offset - bar_offset * segment.bar_length + 1
 
 
 def straight_grid_size_beats(bar_length: float) -> float:

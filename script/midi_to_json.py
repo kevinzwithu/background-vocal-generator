@@ -99,14 +99,7 @@ class TimeSignatureEvent:
     order: int
 
 
-@dataclass(frozen=True)
-class TimeSignatureSegment:
-    start: float
-    numerator: int
-    denominator: int
-    bar_length: float
-    grid_size: float
-    start_bar: int
+TimeSignatureSegment = project_common.TimeSignatureSegment
 
 
 def read_exact(data: bytes, offset: int, size: int, label: str) -> tuple[bytes, int]:
@@ -244,13 +237,10 @@ def validate_tolerance(tolerance: float) -> None:
 
 def parse_track(
     data: bytes,
-    ticks_per_beat: int,
     track_index: int,
     event_order_start: int,
     lyric_encoding: str = DEFAULT_LYRIC_ENCODING,
 ) -> tuple[TrackData, list[TempoEvent], list[TimeSignatureEvent], int]:
-    del ticks_per_beat
-
     offset = 0
     abs_ticks = 0
     running_status: int | None = None
@@ -431,7 +421,6 @@ def parse_midi(
         track_payload, offset = read_exact(data, offset, track_length, f"track {track_index}")
         track, track_tempos, track_sigs, event_order = parse_track(
             track_payload,
-            ticks_per_beat,
             track_index,
             event_order,
             lyric_encoding,
@@ -513,43 +502,11 @@ def remove_redundant_timeline_values(
     return output
 
 
-def build_time_signature_segments(
-    time_signature_map: list[dict[str, Any]],
-) -> list[TimeSignatureSegment]:
-    segments: list[TimeSignatureSegment] = []
-    current_start_bar = 1
-
-    for index, item in enumerate(time_signature_map):
-        start = float(item["time"])
-        numerator = int(item["numerator"])
-        denominator = int(item["denominator"])
-        bar_length = numerator * 4 / denominator
-        grid_size = project_common.straight_grid_size_beats(bar_length)
-
-        if index > 0:
-            previous = segments[-1]
-            elapsed = start - previous.start
-            bars_elapsed = elapsed / previous.bar_length
-            rounded = round(bars_elapsed)
-            if abs(bars_elapsed - rounded) > 1e-6:
-                raise MidiValidationError(
-                    "Time signature change is not aligned to the previous bar boundary: "
-                    f"time={normalize_number(start)} beats."
-                )
-            current_start_bar = previous.start_bar + rounded
-
-        segments.append(
-            TimeSignatureSegment(
-                start=start,
-                numerator=numerator,
-                denominator=denominator,
-                bar_length=bar_length,
-                grid_size=grid_size,
-                start_bar=current_start_bar,
-            )
-        )
-
-    return segments
+def build_time_signature_segments(time_signature_map: list[dict[str, Any]]) -> list[TimeSignatureSegment]:
+    try:
+        return project_common.build_time_signature_segments(time_signature_map)
+    except ValueError as exc:
+        raise MidiValidationError(str(exc)) from exc
 
 
 def quantization_details(
@@ -570,15 +527,9 @@ def quantization_details(
 
 def bar_position(segments: list[TimeSignatureSegment], time: float) -> tuple[int, int | float, int]:
     segment = project_common.segment_for_time(segments, time)
-    offset = max(0.0, time - segment.start)
-    bar_offset = math.floor((offset + 1e-9) / segment.bar_length)
-    bar_start = segment.start + bar_offset * segment.bar_length
-    offset_in_bar = max(0.0, time - bar_start)
-    beat = 1 + offset_in_bar
-    grid = round(offset_in_bar / segment.grid_size)
-    if grid >= project_common.STRAIGHT_GRID_DIVISIONS_PER_BAR:
-        grid = project_common.STRAIGHT_GRID_DIVISIONS_PER_BAR - 1
-    return segment.start_bar + bar_offset, normalize_number(beat), grid
+    bar, beat = project_common.bar_and_beat(segments, time)
+    grid = min(round((beat - 1) / segment.grid_size), project_common.STRAIGHT_GRID_DIVISIONS_PER_BAR - 1)
+    return bar, normalize_number(beat), grid
 
 
 def validate_required_track_set(tracks: list[TrackData]) -> None:
@@ -753,8 +704,8 @@ def convert_control_notes(
     return output
 
 
-def validate_chord_alignment(notes: list[dict[str, Any]], tolerance: float) -> None:
-    for group in group_notes_by_start(notes, tolerance):
+def validate_chord_alignment(groups: list[list[dict[str, Any]]], tolerance: float) -> None:
+    for group in groups:
         if len(group) <= 1:
             continue
         expected_end = float(group[0]["time"]) + float(group[0]["duration"])
@@ -793,19 +744,9 @@ def validate_no_overlapping_notes(
 
 
 def filter_non_chord_groups(
-    notes: list[dict[str, Any]],
-    tolerance: float,
-) -> list[dict[str, Any]]:
-    chord_notes: list[dict[str, Any]] = []
-    for group in group_notes_by_start(notes, tolerance):
-        pitch_classes = {int(note["midi"]) % 12 for note in group}
-        if len(pitch_classes) > 1:
-            chord_notes.extend(group)
-
-    return sorted(
-        chord_notes,
-        key=lambda item: (float(item["time"]), float(item["duration"]), item["midi"]),
-    )
+    groups: list[list[dict[str, Any]]],
+) -> list[list[dict[str, Any]]]:
+    return [group for group in groups if len({int(note["midi"]) % 12 for note in group}) > 1]
 
 
 def group_notes_by_start(
@@ -827,7 +768,7 @@ def note_end(note: dict[str, Any]) -> float:
 
 def validate_piece_limits(
     melody_notes: list[dict[str, Any]],
-    chord_notes: list[dict[str, Any]],
+    chord_groups: list[list[dict[str, Any]]],
     tempo_map: list[dict[str, Any]],
     segments: list[TimeSignatureSegment],
     duration: float,
@@ -835,7 +776,7 @@ def validate_piece_limits(
 ) -> None:
     if not melody_notes:
         raise MidiValidationError("Melody track must contain at least one valid note.")
-    if not chord_notes:
+    if not chord_groups:
         raise MidiValidationError("Chord track must contain at least one valid chord.")
 
     bar_count, seconds = project_common.piece_metrics(duration, segments, tempo_map)
@@ -857,7 +798,7 @@ def validate_piece_limits(
             min(float(note["time"]) for note in group),
             max(note_end(note) for note in group),
         )
-        for group in group_notes_by_start(chord_notes, tolerance)
+        for group in chord_groups
     )
     melody_index = 0
     for chord_start, chord_end in chord_intervals:
@@ -1090,9 +1031,14 @@ def convert_selected_tracks_to_json(
         "chord",
     )
     melody_notes, melody_octave_shift = normalize_melody_register(melody_notes)
-    validate_chord_alignment(chord_notes, tolerance)
+    chord_groups = group_notes_by_start(chord_notes, tolerance)
+    validate_chord_alignment(chord_groups, tolerance)
     validate_no_overlapping_notes(melody_notes, "melody", tolerance)
-    chord_notes = filter_non_chord_groups(chord_notes, tolerance)
+    chord_groups = filter_non_chord_groups(chord_groups)
+    chord_notes = sorted(
+        (note for group in chord_groups for note in group),
+        key=lambda note: (float(note["time"]), float(note["duration"]), note["midi"]),
+    )
 
     header = build_header(melody_notes, chord_notes, tempo_map, time_signature_map)
     duration = float(header["duration"])
@@ -1103,7 +1049,7 @@ def convert_selected_tracks_to_json(
     )
     validate_piece_limits(
         melody_notes,
-        chord_notes,
+        chord_groups,
         tempo_map,
         segments,
         duration,

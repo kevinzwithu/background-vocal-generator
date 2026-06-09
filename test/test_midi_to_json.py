@@ -886,13 +886,13 @@ class MidiToJsonTest(unittest.TestCase):
         payload = meta_event(0, 0x03, b"melody")
 
         with self.assertRaisesRegex(midi_to_json.MidiParseError, "missing End-of-Track"):
-            midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+            midi_to_json.parse_track(payload, 0, 0)
 
     def test_rejects_non_empty_end_of_track_payload(self) -> None:
         payload = meta_event(0, 0x2F, b"x")
 
         with self.assertRaisesRegex(midi_to_json.MidiParseError, "payload must be empty"):
-            midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+            midi_to_json.parse_track(payload, 0, 0)
 
     def test_rejects_data_or_duplicate_event_after_end_of_track(self) -> None:
         cases = [
@@ -905,7 +905,7 @@ class MidiToJsonTest(unittest.TestCase):
                 midi_to_json.MidiParseError,
                 "data found after End-of-Track",
             ):
-                midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+                midi_to_json.parse_track(payload, 0, 0)
 
     def test_pairs_nested_same_pitch_notes_in_fifo_order(self) -> None:
         payload = (
@@ -916,7 +916,7 @@ class MidiToJsonTest(unittest.TestCase):
             + meta_event(0, 0x2F, b"")
         )
 
-        track, _, _, _ = midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+        track, _, _, _ = midi_to_json.parse_track(payload, 0, 0)
 
         self.assertEqual(
             [(note.start_ticks, note.end_ticks) for note in track.notes],
@@ -931,7 +931,7 @@ class MidiToJsonTest(unittest.TestCase):
             + meta_event(0, 0x2F, b"")
         )
 
-        track, _, _, _ = midi_to_json.parse_track(payload, TICKS_PER_BEAT, 0, 0)
+        track, _, _, _ = midi_to_json.parse_track(payload, 0, 0)
 
         self.assertEqual(len(track.notes), note_count)
 
