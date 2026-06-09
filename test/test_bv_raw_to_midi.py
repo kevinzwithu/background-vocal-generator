@@ -290,6 +290,8 @@ class BvRawToMidiTest(unittest.TestCase):
             payload_tracks = melody_aligned_tracks()
             for track_name in ("HHA", "HHB", "HHF", "LHA", "LHB", "LHF"):
                 payload_tracks[track_name] = payload_tracks[track_name][:1]
+            for track_name in ("VocalPad1", "VocalPad2", "VocalPad3", "VocalPad4"):
+                payload_tracks[track_name] = []
             bv_path = root / "bv_raw.json"
             bv_path.write_text(
                 json.dumps({"header": header(), "tracks": payload_tracks}),
@@ -299,6 +301,76 @@ class BvRawToMidiTest(unittest.TestCase):
             output_path = bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
 
             self.assertTrue(output_path.exists())
+
+    def test_rejects_pad_onset_or_sustain_inside_no_bv(self) -> None:
+        for pad_time, pad_duration in ((1, 0.5), (0, 1.5)):
+            with self.subTest(time=pad_time), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                (root / "melody.json").write_text(
+                    json.dumps(
+                        {
+                            "header": header(),
+                            "melody": melody(),
+                            "control": [
+                                {"section": "no_bv", "time": 1, "duration": 1}
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                payload_tracks = melody_aligned_tracks()
+                for track_name in ("HHA", "HHB", "HHF", "LHA", "LHB", "LHF"):
+                    payload_tracks[track_name] = payload_tracks[track_name][:1]
+                payload_tracks["VocalPad1"] = [
+                    {
+                        "name": "C4",
+                        "midi": 60,
+                        "time": pad_time,
+                        "duration": pad_duration,
+                    }
+                ]
+                for track_name in ("VocalPad2", "VocalPad3", "VocalPad4"):
+                    payload_tracks[track_name] = []
+                bv_path = root / "bv_raw.json"
+                bv_path.write_text(
+                    json.dumps({"header": header(), "tracks": payload_tracks}),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "overlaps no_bv"):
+                    bv_raw_to_midi.convert_bv_raw_to_midi(bv_path)
+
+    def test_uses_public_c0_to_c6_range_for_every_bv_track(self) -> None:
+        for midi, passes in ((84, True), (85, False)):
+            with self.subTest(midi=midi), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                payload_tracks = tracks()
+                payload_tracks["VocalPad1"] = [
+                    {
+                        "name": "C6" if midi == 84 else "C#6",
+                        "midi": midi,
+                        "time": 0,
+                        "duration": 1,
+                    }
+                ]
+                bv_path = root / "bv_raw.json"
+                bv_path.write_text(
+                    json.dumps({"header": header(), "tracks": payload_tracks}),
+                    encoding="utf-8",
+                )
+
+                if passes:
+                    output_path = bv_raw_to_midi.convert_bv_raw_to_midi(
+                        bv_path, allow_standalone=True
+                    )
+                    self.assertTrue(output_path.exists())
+                else:
+                    with self.assertRaisesRegex(
+                        bv_raw_to_midi.BvMidiError, "outside the allowed range"
+                    ):
+                        bv_raw_to_midi.convert_bv_raw_to_midi(
+                            bv_path, allow_standalone=True
+                        )
 
     def test_rejects_missing_input_file(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -570,13 +642,13 @@ class BvRawToMidiTest(unittest.TestCase):
                 patch.object(bv_raw_to_midi, "MAX_SOURCE_MELODY_NOTES", 1),
                 self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "Source melody note count"),
             ):
-                bv_raw_to_midi.sibling_melody(bv_path)
+                bv_raw_to_midi.load_source_json(root)
 
             with (
                 patch.object(bv_raw_to_midi, "MAX_CONTROL_EVENTS", 1),
                 self.assertRaisesRegex(bv_raw_to_midi.BvMidiError, "Control event count"),
             ):
-                bv_raw_to_midi.sibling_control(bv_path)
+                bv_raw_to_midi.load_source_json(root)
 
     def test_rejects_ticks_per_beat_that_sets_smpte_division_bit(self) -> None:
         with TemporaryDirectory() as temp_dir:

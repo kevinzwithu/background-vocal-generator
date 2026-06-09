@@ -1,0 +1,7 @@
+Time Unit: beats
+
+Bar 1: Time Signature 4/4, BPM 120
+Bar 1: beat 1 C13
+Bar 2: beat 1 C13
+Bar 3: beat 1 C13
+Bar 4: beat 1 C13

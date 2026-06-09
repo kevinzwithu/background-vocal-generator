@@ -1,0 +1,16 @@
+{
+  "harmonyIndependence": {
+    "lead": [60, 62, 64, 65, 67, 69, 67, 65],
+    "expressive": [64, 65, 67, 69, 71, 72, 71, 69],
+    "distinctFlat": [72, 72, 71, 72, 74, 72, 71, 72],
+    "shortCommonOnly": [64, 68, 69, 70, 73, 74, 73, 70]
+  },
+  "crossChordSustain": {
+    "duration": 2,
+    "events": [
+      {"time": 0, "chord": "C"},
+      {"time": 1, "chord": "F"}
+    ],
+    "note": {"name": "E4", "midi": 64, "time": 0, "duration": 2}
+  }
+}

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Convert project bv_raw.json into a Standard MIDI file."""
+"""Expand background-vocal plans into raw data and export raw data to MIDI."""
 
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
+import copy
+import hashlib
 import json
 import math
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,19 @@ except ModuleNotFoundError:
 
 DEFAULT_TICKS_PER_BEAT = 480
 MAX_JSON_FILE_BYTES = 5 * 1024 * 1024
+MAX_PLAN_FILE_BYTES = 1024 * 1024
+MAX_NOTE_TXT_FILE_BYTES = 100 * 1024
+MAX_PAD_BLOCKS = 50_000
+MAX_LEAD_OCTAVE_SHIFT = 72
+V1_PLAN_SCHEMA = "bv-plan-v1"
+V2_PLAN_SCHEMA = "bv-plan-v2"
+PLAN_PAD_POLICIES = ("sectional", "optional", "required")
+EXPECTED_PLAN_KEYS = {
+    "schemaVersion", "sourceFingerprint", "padPolicy", "leadOctaveShift",
+    "harmonyPitches", "padBlocks",
+}
+PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+VALIDATION_TOLERANCE = 0.01
 MAX_BARS = project_common.MAX_BARS
 MAX_SECONDS = project_common.MAX_SECONDS
 MAX_NOTES_PER_TRACK = 50_000
@@ -39,7 +54,7 @@ MAX_TIME_SIGNATURE_BYTE = project_common.MAX_TIME_SIGNATURE_BYTE
 MAX_TOLERANCE = project_common.MAX_TOLERANCE
 C0_MIDI = 12
 C6_MIDI = 84
-BV_HARMONY_MAX_MIDI = 87
+BV_HARMONY_MAX_MIDI = C6_MIDI
 EXPECTED_TRACKS = (
     "LeadDouble",
     "HHA",
@@ -64,13 +79,7 @@ class BvMidiError(Exception):
     pass
 
 
-@dataclass(frozen=True)
-class TimeSignatureSegment:
-    start: float
-    numerator: int
-    denominator: int
-    bar_length: float
-    grid_size: float
+TimeSignatureSegment = project_common.TimeSignatureSegment
 
 
 def remove_temp_file(path: Path) -> None:
@@ -97,7 +106,7 @@ def write_bytes_atomically(path: Path, payload: bytes, overwrite: bool = True) -
             try:
                 os.link(temp_path, path)
             except FileExistsError as exc:
-                raise BvMidiError(f"Output MIDI file already exists: {path}") from exc
+                raise BvMidiError(f"Output file already exists: {path}") from exc
     finally:
         if temp_path is not None:
             remove_temp_file(temp_path)
@@ -183,16 +192,17 @@ def parse_bounded_json_int(text: str) -> int:
     return int(text)
 
 
-def read_json(path: Path) -> dict[str, Any]:
+def read_json(path: Path, *, max_bytes: int | None = None) -> dict[str, Any]:
+    limit = MAX_JSON_FILE_BYTES if max_bytes is None else max_bytes
     try:
         if not path.exists():
             raise BvMidiError(f"Input JSON file does not exist: {path}")
         if not path.is_file():
             raise BvMidiError(f"Input JSON path is not a file: {path}")
-        reject_if_over_limit(path.stat().st_size, MAX_JSON_FILE_BYTES, "JSON file size")
+        reject_if_over_limit(path.stat().st_size, limit, "JSON file size")
         with path.open("rb") as source:
-            raw = source.read(MAX_JSON_FILE_BYTES + 1)
-        reject_if_over_limit(len(raw), MAX_JSON_FILE_BYTES, "JSON file size")
+            raw = source.read(limit + 1)
+        reject_if_over_limit(len(raw), limit, "JSON file size")
     except OSError as exc:
         raise BvMidiError(f"Unable to inspect or read JSON file {path}: {exc}") from exc
     try:
@@ -206,43 +216,23 @@ def read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def sibling_header(bv_path: Path) -> dict[str, Any]:
-    for name in ("canonical.json", "melody.json"):
-        candidate = bv_path.parent / name
-        if candidate.exists():
-            payload = read_json(candidate)
-            header = payload.get("header")
-            if isinstance(header, dict):
-                return header
+def load_source_json(directory: Path, *, required: bool = False) -> dict[str, Any]:
+    """Read one source snapshot, preferring melody.json over canonical.json."""
+    for name in ("melody.json", "canonical.json"):
+        path = directory / name
+        if not path.exists():
+            continue
+        source = read_json(path)
+        for key, limit, label in (
+            ("melody", MAX_SOURCE_MELODY_NOTES, "Source melody note count"),
+            ("control", MAX_CONTROL_EVENTS, "Control event count"),
+        ):
+            if isinstance(source.get(key), list):
+                reject_if_over_limit(len(source[key]), limit, label)
+        return source
+    if required:
+        raise BvMidiError(f"Missing required source melody.json or canonical.json in {directory}")
     return {}
-
-
-def sibling_melody(bv_path: Path) -> list[dict[str, Any]] | None:
-    for name in ("melody.json", "canonical.json"):
-        candidate = bv_path.parent / name
-        if candidate.exists():
-            payload = read_json(candidate)
-            melody = payload.get("melody")
-            if isinstance(melody, list):
-                reject_if_over_limit(
-                    len(melody),
-                    MAX_SOURCE_MELODY_NOTES,
-                    "Source melody note count",
-                )
-                return melody
-    return None
-
-
-def sibling_control(bv_path: Path) -> list[dict[str, Any]]:
-    for name in ("melody.json", "canonical.json"):
-        candidate = bv_path.parent / name
-        if candidate.exists():
-            payload = read_json(candidate)
-            control = payload.get("control")
-            if isinstance(control, list):
-                reject_if_over_limit(len(control), MAX_CONTROL_EVENTS, "Control event count")
-                return control
-    return []
 
 
 def validate_source_requirement(
@@ -263,8 +253,8 @@ def validate_source_requirement(
         )
 
 
-def resolve_header(payload: dict[str, Any], bv_path: Path) -> dict[str, Any]:
-    header = sibling_header(bv_path)
+def resolve_header(payload: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    header = dict(source["header"]) if isinstance(source.get("header"), dict) else {}
 
     raw_header = payload.get("header")
     if isinstance(raw_header, dict):
@@ -354,34 +344,10 @@ def validate_time_signature_map(time_signature_map: Any) -> None:
 
 
 def build_time_signature_segments(header: dict[str, Any]) -> list[TimeSignatureSegment]:
-    segments: list[TimeSignatureSegment] = []
-    for index, item in enumerate(header["timeSignatureMap"]):
-        start = float(item["time"])
-        numerator = int(item["numerator"])
-        denominator = int(item["denominator"])
-        bar_length = numerator * 4 / denominator
-
-        if index > 0:
-            previous = segments[-1]
-            elapsed = start - previous.start
-            bars_elapsed = elapsed / previous.bar_length
-            rounded = round(bars_elapsed)
-            if abs(bars_elapsed - rounded) > 1e-6:
-                raise BvMidiError(
-                    "Time signature change is not aligned to the previous bar boundary: "
-                    f"time={normalize_number(start)} beats."
-                )
-
-        segments.append(
-            TimeSignatureSegment(
-                start=start,
-                numerator=numerator,
-                denominator=denominator,
-                bar_length=bar_length,
-                grid_size=project_common.straight_grid_size_beats(bar_length),
-            )
-        )
-    return segments
+    try:
+        return project_common.build_time_signature_segments(header["timeSignatureMap"])
+    except ValueError as exc:
+        raise BvMidiError(str(exc)) from exc
 
 
 def quantized(
@@ -518,44 +484,46 @@ def validate_melody_aligned_harmonies(
     melody: list[dict[str, Any]] | None,
     tolerance: float,
     control: list[dict[str, Any]] | None = None,
+    *, sparse: bool = False,
 ) -> None:
     if melody is None:
         return
 
-    raw_no_bv_spans: list[tuple[float, float]] = []
-    for index, item in enumerate(control or []):
-        if not isinstance(item, dict):
-            raise BvMidiError(f"Source control item at index {index} must be an object.")
-        if item.get("section") != "no_bv":
-            continue
-        label = f"Source control item at index {index}"
-        start = require_number(item, "time", label)
-        duration = require_number(item, "duration", label)
-        if start < 0 or duration <= 0:
-            raise BvMidiError(f"{label} must have non-negative time and positive duration.")
-        raw_no_bv_spans.append((start, start + duration))
+    spans = no_bv_spans(control, tolerance)
 
-    no_bv_spans: list[tuple[float, float]] = []
-    for start, end in sorted(raw_no_bv_spans):
-        if no_bv_spans and start <= no_bv_spans[-1][1] + tolerance:
-            previous_start, previous_end = no_bv_spans[-1]
-            no_bv_spans[-1] = (previous_start, max(previous_end, end))
-        else:
-            no_bv_spans.append((start, end))
+    for track_name in PAD_TRACKS:
+        span_index = 0
+        for note in sorted(tracks[track_name], key=lambda item: float(item["time"])):
+            note_start = float(note["time"])
+            note_end = note_start + float(note["duration"])
+            while (
+                span_index < len(spans)
+                and spans[span_index][1] <= note_start + tolerance
+            ):
+                span_index += 1
+            if span_index >= len(spans):
+                break
+            span_start, span_end = spans[span_index]
+            if note_start < span_end - tolerance and note_end > span_start + tolerance:
+                raise BvMidiError(
+                    f"Track {track_name} note at time={note_start:g} duration="
+                    f"{float(note['duration']):g} overlaps no_bv span "
+                    f"{span_start:g}..{span_end:g}."
+                )
 
     def requires_harmony(note: dict[str, Any]) -> bool:
         start = float(note["time"])
         low = 0
-        high = len(no_bv_spans)
+        high = len(spans)
         while low < high:
             middle = (low + high) // 2
-            if no_bv_spans[middle][0] - tolerance <= start:
+            if spans[middle][0] - tolerance <= start:
                 low = middle + 1
             else:
                 high = middle
         if low == 0:
             return True
-        span_start, span_end = no_bv_spans[low - 1]
+        span_start, span_end = spans[low - 1]
         return not (span_start - tolerance <= start < span_end - tolerance)
 
     for index, melody_note in enumerate(melody):
@@ -579,7 +547,7 @@ def validate_melody_aligned_harmonies(
 
     harmony_melody = [note for note in melody if requires_harmony(note)]
     for track_name in MELODY_ALIGNED_TRACKS:
-        if len(tracks[track_name]) != len(harmony_melody):
+        if not sparse and len(tracks[track_name]) != len(harmony_melody):
             raise BvMidiError(
                 f"{track_name} must contain exactly one note per harmony-enabled melody note. "
                 f"Expected {len(harmony_melody)}, found {len(tracks[track_name])}."
@@ -621,13 +589,28 @@ def validate_melody_aligned_harmonies(
         for source_note, lead_note in zip(melody, lead_double)
         if requires_harmony(source_note)
     ]
-    for index, melody_note in enumerate(harmony_lead):
-        melody_midi = int(melody_note["midi"])
-        for track_name in MELODY_ALIGNED_TRACKS:
-            harmony_note = tracks[track_name][index]
+    harmony_by_time = {float(note["time"]): note for note in harmony_lead}
+    for track_name in MELODY_ALIGNED_TRACKS:
+        matched_times: set[float] = set()
+        for index, harmony_note in enumerate(tracks[track_name]):
+            if sparse:
+                onset = float(harmony_note["time"])
+                if onset not in harmony_by_time or onset in matched_times:
+                    raise BvMidiError(f"{track_name} has no unique source onset at {onset:g}.")
+                melody_note = harmony_by_time[onset]
+                matched_times.add(onset)
+            else:
+                melody_note = harmony_lead[index]
+            melody_midi = int(melody_note["midi"])
+            expected_duration = float(melody_note["duration"])
+            if sparse:
+                for left, right in spans:
+                    if float(melody_note["time"]) < left < float(melody_note["time"]) + expected_duration:
+                        expected_duration = left - float(melody_note["time"])
+                        break
             if (
                 abs(float(harmony_note["time"]) - float(melody_note["time"])) > tolerance
-                or abs(float(harmony_note["duration"]) - float(melody_note["duration"])) > tolerance
+                or abs(float(harmony_note["duration"]) - expected_duration) > tolerance
             ):
                 raise BvMidiError(
                     f"{track_name} must align to melody timing at index {index}. "
@@ -650,52 +633,12 @@ def validate_melody_aligned_harmonies(
                     f"{track_name} must be lower than melody at index {index}. "
                     f"melody={melody_midi}, harmony={harmony_midi}."
                 )
-            expected_lyric = harmony_melody[index].get("lyric")
+            expected_lyric = melody_note.get("lyric")
             if harmony_note.get("lyric") != expected_lyric:
                 raise BvMidiError(
                     f"Track {track_name} note at time={melody_note['time']} must inherit "
                     f"lyric {expected_lyric!r}; found {harmony_note.get('lyric')!r}."
                 )
-
-
-def tracks_with_source_lyrics(
-    tracks: dict[str, list[dict[str, Any]]],
-    melody: list[dict[str, Any]] | None,
-    control: list[dict[str, Any]] | None,
-    tolerance: float,
-) -> dict[str, list[dict[str, Any]]]:
-    output = {name: [dict(note) for note in notes] for name, notes in tracks.items()}
-    if melody is None:
-        return output
-
-    no_bv_spans = [
-        (
-            require_number(item, "time", "Source control item"),
-            require_number(item, "time", "Source control item")
-            + require_number(item, "duration", "Source control item"),
-        )
-        for item in control or []
-        if isinstance(item, dict) and item.get("section") == "no_bv"
-    ]
-
-    def enabled(note: dict[str, Any]) -> bool:
-        start = float(note["time"])
-        return not any(a - tolerance <= start < b - tolerance for a, b in no_bv_spans)
-
-    for target, source in zip(output["LeadDouble"], melody):
-        target.pop("lyric", None)
-        if "lyric" in source:
-            target["lyric"] = source["lyric"]
-    harmony_melody = [note for note in melody if enabled(note)]
-    for track_name in MELODY_ALIGNED_TRACKS:
-        for target, source in zip(output[track_name], harmony_melody):
-            target.pop("lyric", None)
-            if "lyric" in source:
-                target["lyric"] = source["lyric"]
-    for track_name in PAD_TRACKS:
-        for target in output[track_name]:
-            target.pop("lyric", None)
-    return output
 
 
 def vlq(value: int) -> bytes:
@@ -836,6 +779,486 @@ def validate_header_bounds(header: dict[str, Any], max_note_end: float) -> float
     return header_duration
 
 
+def midi_name(midi: int) -> str:
+    return f"{PITCH_NAMES[midi % 12]}{midi // 12 - 1}"
+
+
+def read_note_text(path: Path) -> str:
+    try:
+        if not path.exists():
+            raise BvMidiError(f"Missing required note.txt: {path}")
+        if not path.is_file():
+            raise BvMidiError(f"note.txt path is not a file: {path}")
+        reject_if_over_limit(path.stat().st_size, MAX_NOTE_TXT_FILE_BYTES, "note.txt size")
+        with path.open("rb") as source:
+            raw = source.read(MAX_NOTE_TXT_FILE_BYTES + 1)
+        reject_if_over_limit(len(raw), MAX_NOTE_TXT_FILE_BYTES, "note.txt size")
+    except OSError as exc:
+        raise BvMidiError(f"Unable to inspect or read note.txt {path}: {exc}") from exc
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BvMidiError("note.txt must use UTF-8.") from exc
+
+
+def validate_header(header: Any) -> dict[str, Any]:
+    if not isinstance(header, dict):
+        raise BvMidiError("Source header must be an object.")
+    required = {
+        "startTime",
+        "duration",
+        "timeUnit",
+        "grid",
+        "tempoMap",
+        "timeSignatureMap",
+    }
+    missing = sorted(required - set(header))
+    if missing:
+        raise BvMidiError(f"Source header is missing: {', '.join(missing)}")
+    if header["timeUnit"] != "beats":
+        raise BvMidiError("Source header.timeUnit must be 'beats'.")
+    if header["grid"] != "1/32_bar":
+        raise BvMidiError("Source header.grid must be '1/32_bar'.")
+    start = require_number(header, "startTime", "Source header")
+    duration = require_number(header, "duration", "Source header")
+    validate_tempo_map(header["tempoMap"])
+    validate_time_signature_map(header["timeSignatureMap"])
+    segments = build_time_signature_segments(header)
+    validate_piece_limits(header, segments)
+    if abs(start) > 1e-9:
+        raise BvMidiError("Source header.startTime must be 0.")
+    if duration <= 0:
+        raise BvMidiError("Source header.duration must be positive.")
+    return copy.deepcopy(header)
+
+
+def validate_source_melody(melody: Any, duration: float) -> list[dict[str, Any]]:
+    if not isinstance(melody, list):
+        raise BvMidiError("Source JSON must contain a melody list.")
+    reject_if_over_limit(
+        len(melody),
+        MAX_SOURCE_MELODY_NOTES,
+        "Source melody note count",
+    )
+    validated: list[dict[str, Any]] = []
+    for index, note in enumerate(melody):
+        if not isinstance(note, dict):
+            raise BvMidiError(f"Source melody note at index {index} must be an object.")
+        label = f"Source melody note at index {index}"
+        if "name" not in note or not isinstance(note["name"], str):
+            raise BvMidiError(f"{label}.name must be a string.")
+        midi = require_int(note, "midi", label)
+        time = require_number(note, "time", label)
+        note_duration = require_number(note, "duration", label)
+        if time < 0 or note_duration <= 0 or time + note_duration > duration + 1e-9:
+            raise BvMidiError(f"{label} is outside source header.duration.")
+        if not 0 <= midi <= 127:
+            raise BvMidiError(f"{label}.midi must be between 0 and 127.")
+        if "lyric" in note:
+            lyric = note["lyric"]
+            if not isinstance(lyric, str):
+                raise BvMidiError(f"{label}.lyric must be a string.")
+            if "\x00" in lyric:
+                raise BvMidiError(f"{label}.lyric must not contain NUL.")
+            reject_if_over_limit(
+                len(lyric.encode("utf-8")),
+                MAX_LYRIC_BYTES,
+                f"{label} lyric size",
+            )
+        validated.append(note)
+    return validated
+
+
+def validate_control(control: Any, duration: float) -> list[dict[str, Any]]:
+    if control is None:
+        return []
+    if not isinstance(control, list):
+        raise BvMidiError("Source control must be a list when present.")
+    reject_if_over_limit(
+        len(control), MAX_CONTROL_EVENTS, "Source control event count"
+    )
+    for index, item in enumerate(control):
+        if not isinstance(item, dict):
+            raise BvMidiError(f"Source control item at index {index} must be an object.")
+        if item.get("section") != "no_bv":
+            continue
+        label = f"Source control item at index {index}"
+        start = require_number(item, "time", label)
+        span_duration = require_number(item, "duration", label)
+        if start < 0 or span_duration <= 0 or start + span_duration > duration + 1e-9:
+            raise BvMidiError(f"{label} no_bv span is outside source duration.")
+    return control
+
+
+def load_source_bundle(
+    directory: Path, source: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], str]:
+    if source is None:
+        source = load_source_json(directory, required=True)
+    header = validate_header(source.get("header"))
+    melody = validate_source_melody(source.get("melody"), float(header["duration"]))
+    control = validate_control(source.get("control", []), float(header["duration"]))
+    note_text = read_note_text(directory / "note.txt")
+    return header, melody, control, note_text
+
+
+def source_fingerprint(
+    header: dict[str, Any],
+    melody: list[dict[str, Any]],
+    control: list[dict[str, Any]],
+    note_text: str,
+) -> str:
+    canonical = json.dumps(
+        {
+            "header": header,
+            "melody": melody,
+            "control": control,
+            "noteTxt": note_text,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def no_bv_spans(
+    control: list[dict[str, Any]] | None,
+    tolerance: float = VALIDATION_TOLERANCE,
+) -> list[tuple[float, float]]:
+    raw_no_bv_spans: list[tuple[float, float]] = []
+    for index, item in enumerate(control or []):
+        if not isinstance(item, dict):
+            raise BvMidiError(f"Source control item at index {index} must be an object.")
+        if item.get("section") != "no_bv":
+            continue
+        label = f"Source control item at index {index}"
+        start = require_number(item, "time", label)
+        duration = require_number(item, "duration", label)
+        if start < 0 or duration <= 0:
+            raise BvMidiError(f"{label} must have non-negative time and positive duration.")
+        raw_no_bv_spans.append((start, start + duration))
+
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(raw_no_bv_spans):
+        if merged and start <= merged[-1][1] + tolerance:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+
+    return merged
+
+def harmony_enabled_melody(
+    melody: list[dict[str, Any]], control: list[dict[str, Any]] | None,
+    tolerance: float = VALIDATION_TOLERANCE,
+) -> list[dict[str, Any]]:
+    spans = no_bv_spans(control, tolerance)
+    starts = [start for start, _ in spans]
+
+    def enabled(note: dict[str, Any]) -> bool:
+        start = float(note["time"])
+        index = bisect_right(starts, start + tolerance) - 1
+        if index < 0:
+            return True
+        span_start, span_end = spans[index]
+        return not (
+            span_start - tolerance
+            <= start
+            < span_end - tolerance
+        )
+
+    return [note for note in melody if enabled(note)]
+
+
+def require_json_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BvMidiError(f"{label} must be a JSON integer.")
+    return value
+
+
+def require_finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BvMidiError(f"{label} must be a JSON number.")
+    resolved = float(value)
+    if not math.isfinite(resolved):
+        raise BvMidiError(f"{label} must be finite.")
+    return resolved
+
+
+def validate_plan(
+    plan: dict[str, Any],
+    expected_fingerprint: str,
+    harmony_note_count: int,
+    header: dict[str, Any],
+) -> dict[str, Any]:
+    missing = sorted(EXPECTED_PLAN_KEYS - set(plan))
+    extra = sorted(set(plan) - EXPECTED_PLAN_KEYS)
+    if missing:
+        raise BvMidiError(f"Plan is missing key(s): {', '.join(missing)}")
+    if extra:
+        raise BvMidiError(f"Plan has unexpected key(s): {', '.join(extra)}")
+    if plan["schemaVersion"] not in (V1_PLAN_SCHEMA, V2_PLAN_SCHEMA):
+        raise BvMidiError("schemaVersion must be bv-plan-v1 or bv-plan-v2.")
+    sparse = plan["schemaVersion"] == V2_PLAN_SCHEMA
+    fingerprint = plan["sourceFingerprint"]
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+        raise BvMidiError("sourceFingerprint must be a 64-character SHA-256 hex string.")
+    try:
+        int(fingerprint, 16)
+    except ValueError as exc:
+        raise BvMidiError("sourceFingerprint must contain lowercase hexadecimal characters.") from exc
+    if fingerprint != fingerprint.lower():
+        raise BvMidiError("sourceFingerprint must use lowercase hexadecimal characters.")
+    if fingerprint != expected_fingerprint:
+        raise BvMidiError(
+            "sourceFingerprint does not match melody/header/control/note.txt. "
+            f"Expected {expected_fingerprint}, found {fingerprint}."
+        )
+    if plan["padPolicy"] not in (("free",) if sparse else PLAN_PAD_POLICIES):
+        raise BvMidiError(
+            "padPolicy must be free for v2, or sectional/optional/required for v1."
+        )
+    lead_shift = require_json_int(plan["leadOctaveShift"], "leadOctaveShift")
+    if lead_shift % 12 != 0 or abs(lead_shift) > MAX_LEAD_OCTAVE_SHIFT:
+        raise BvMidiError(
+            f"leadOctaveShift must be a whole-octave value between -{MAX_LEAD_OCTAVE_SHIFT} and {MAX_LEAD_OCTAVE_SHIFT}."
+        )
+
+    harmony_pitches = plan["harmonyPitches"]
+    if not isinstance(harmony_pitches, dict):
+        raise BvMidiError("harmonyPitches must be an object.")
+    missing_tracks = sorted(set(MELODY_ALIGNED_TRACKS) - set(harmony_pitches))
+    extra_tracks = sorted(set(harmony_pitches) - set(MELODY_ALIGNED_TRACKS))
+    if missing_tracks or extra_tracks:
+        raise BvMidiError(
+            "harmonyPitches must contain exactly "
+            f"{', '.join(MELODY_ALIGNED_TRACKS)}; missing={missing_tracks}, extra={extra_tracks}."
+        )
+    for track_name in MELODY_ALIGNED_TRACKS:
+        pitches = harmony_pitches[track_name]
+        if not isinstance(pitches, list):
+            raise BvMidiError(f"harmonyPitches.{track_name} must be a list.")
+        reject_if_over_limit(
+            len(pitches),
+            MAX_SOURCE_MELODY_NOTES,
+            f"harmonyPitches.{track_name} decision count",
+        )
+        if len(pitches) != harmony_note_count:
+            raise BvMidiError(
+                f"harmonyPitches.{track_name} must contain exactly {harmony_note_count} "
+                f"harmony-enabled melody decisions; found {len(pitches)}."
+            )
+        for index, pitch in enumerate(pitches):
+            if sparse and pitch is None:
+                continue
+            midi = require_json_int(pitch, f"harmonyPitches.{track_name}[{index}]")
+            if not C0_MIDI <= midi <= C6_MIDI:
+                raise BvMidiError(
+                    f"harmonyPitches.{track_name}[{index}] must be MIDI 12..84."
+                )
+
+    pad_blocks = plan["padBlocks"]
+    if not isinstance(pad_blocks, list):
+        raise BvMidiError("padBlocks must be a list.")
+    reject_if_over_limit(len(pad_blocks), MAX_PAD_BLOCKS, "Pad block count")
+    previous_time = -1.0
+    previous_end = -1.0
+    source_duration = float(header["duration"])
+    for index, block in enumerate(pad_blocks):
+        if not isinstance(block, dict):
+            raise BvMidiError(f"padBlocks[{index}] must be an object.")
+        if set(block) != {"time", "duration", "pitches"}:
+            raise BvMidiError(
+                f"padBlocks[{index}] must contain exactly time, duration, pitches."
+            )
+        time = require_finite_number(block["time"], f"padBlocks[{index}].time")
+        duration = require_finite_number(
+            block["duration"], f"padBlocks[{index}].duration"
+        )
+        pitches = block["pitches"]
+        if not isinstance(pitches, list) or len(pitches) != len(PAD_TRACKS):
+            raise BvMidiError(f"padBlocks[{index}].pitches must contain exactly four MIDI values.")
+        resolved_pitches = [
+            require_json_int(pitch, f"padBlocks[{index}].pitches[{pitch_index}]")
+            for pitch_index, pitch in enumerate(pitches)
+        ]
+        if any(
+            midi < C0_MIDI or midi > C6_MIDI
+            for midi in resolved_pitches
+        ):
+            raise BvMidiError(f"padBlocks[{index}].pitches must stay within MIDI 12..84.")
+        if not all(
+            upper > lower
+            for upper, lower in zip(resolved_pitches, resolved_pitches[1:])
+        ):
+            raise BvMidiError(
+                f"padBlocks[{index}].pitches must descend in VocalPad1..4 order without crossing."
+            )
+        if time < 0 or duration <= 0 or time + duration > source_duration + 1e-9:
+            raise BvMidiError(f"padBlocks[{index}] is outside source header.duration.")
+        if time < previous_time - 1e-9:
+            raise BvMidiError("padBlocks must be ordered by non-decreasing time.")
+        if time < previous_end - VALIDATION_TOLERANCE:
+            raise BvMidiError(f"padBlocks[{index}] overlaps the previous Pad block.")
+        previous_time = time
+        previous_end = time + duration
+    return plan
+
+
+def note_from_source(source: dict[str, Any], midi: int) -> dict[str, Any]:
+    note: dict[str, Any] = {
+        "name": midi_name(midi),
+        "midi": midi,
+        "time": source["time"],
+        "duration": source["duration"],
+    }
+    if "lyric" in source:
+        note["lyric"] = source["lyric"]
+    return note
+
+
+def expand_plan(
+    plan: dict[str, Any],
+    header: dict[str, Any],
+    melody: list[dict[str, Any]],
+    control: list[dict[str, Any]],
+) -> dict[str, Any]:
+    tracks: dict[str, list[dict[str, Any]]] = {
+        track_name: [] for track_name in EXPECTED_TRACKS
+    }
+    lead_shift = int(plan["leadOctaveShift"])
+    for source_note in melody:
+        tracks["LeadDouble"].append(
+            note_from_source(source_note, int(source_note["midi"]) + lead_shift)
+        )
+
+    sparse = plan["schemaVersion"] == V2_PLAN_SCHEMA
+    harmony_melody = melody if sparse else harmony_enabled_melody(melody, control)
+    spans = no_bv_spans(control)
+    for track_name in MELODY_ALIGNED_TRACKS:
+        tracks[track_name] = [
+            note_from_source(source_note, int(midi))
+            for source_note, midi in zip(
+                harmony_melody, plan["harmonyPitches"][track_name]
+            )
+            if midi is not None
+        ]
+
+    if sparse:
+        for track_name in MELODY_ALIGNED_TRACKS:
+            for note in tracks[track_name]:
+                clip_at_silence(note, spans)
+
+    for block in plan["padBlocks"]:
+        time = normalize_number(float(block["time"]))
+        duration = normalize_number(float(block["duration"]))
+        for track_name, midi in zip(PAD_TRACKS, block["pitches"]):
+            tracks[track_name].append(
+                {
+                    "name": midi_name(int(midi)),
+                    "midi": int(midi),
+                    "time": time,
+                    "duration": duration,
+                }
+            )
+    if sparse:
+        for track_name in PAD_TRACKS:
+            for note in tracks[track_name]:
+                clip_at_silence(note, spans)
+    return {"header": copy.deepcopy(header), "tracks": tracks}
+
+
+def clip_at_silence(note: dict[str, Any], spans: list[tuple[float, float]]) -> None:
+    """Cut a sustain at the first silence boundary; never resume it."""
+    start = float(note["time"])
+    end = start + float(note["duration"])
+    for left, right in spans:
+        if left - VALIDATION_TOLERANCE <= start < right - VALIDATION_TOLERANCE:
+            raise BvMidiError(f"A sounding decision starts inside no_bv at {start:g}; use null/rest.")
+        if start < left < end:
+            note["duration"] = normalize_number(left - start)
+            break
+
+
+def validate_rendered_payload(
+    payload: dict[str, Any],
+    melody: list[dict[str, Any]],
+    control: list[dict[str, Any]],
+    *, sparse: bool = False,
+) -> None:
+    header = payload["header"]
+    tracks = payload["tracks"]
+    try:
+        segments = build_time_signature_segments(header)
+        max_note_end = validate_notes(
+            tracks, segments, VALIDATION_TOLERANCE
+        )
+        validate_header_bounds(header, max_note_end)
+        validate_melody_aligned_harmonies(
+            tracks, melody, VALIDATION_TOLERANCE, control, sparse=sparse
+        )
+    except BvMidiError as exc:
+        raise BvMidiError(f"Rendered plan violates raw contract: {exc}") from exc
+
+
+def deterministic_raw_bytes(payload: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def resolve_plan_path(path: Path) -> Path:
+    return path / "bv_plan.json" if path.is_dir() else path
+
+
+def prepare_plan_render(
+    plan_path: Path, *, source: dict[str, Any] | None = None,
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    """Validate a plan and expand it in memory without writing bv_raw.json."""
+    resolved_plan_path = resolve_plan_path(plan_path)
+    directory = resolved_plan_path.parent
+    header, melody, control, note_text = load_source_bundle(directory, source)
+    fingerprint = source_fingerprint(header, melody, control, note_text)
+    plan = read_json(resolved_plan_path, max_bytes=MAX_PLAN_FILE_BYTES)
+    harmony_melody = harmony_enabled_melody(melody, control)
+    sparse = plan.get("schemaVersion") == V2_PLAN_SCHEMA
+    validate_plan(plan, fingerprint, len(melody) if sparse else len(harmony_melody), header)
+    payload = expand_plan(plan, header, melody, control)
+    validate_rendered_payload(payload, melody, control, sparse=sparse)
+    return resolved_plan_path, plan, payload
+
+
+def render_plan(
+    plan_path: Path,
+    output_path: Path | None = None,
+    *,
+    force: bool = False,
+) -> Path:
+    resolved_plan_path, _, payload = prepare_plan_render(plan_path)
+    directory = resolved_plan_path.parent
+    destination = output_path or directory / "bv_raw.json"
+    protected_paths = {
+        resolved_plan_path.resolve(),
+        (directory / "melody.json").resolve(),
+        (directory / "canonical.json").resolve(),
+        (directory / "note.txt").resolve(),
+    }
+    if destination.resolve() in protected_paths:
+        raise BvMidiError(
+            f"Output path must not replace a plan or source file: {destination}"
+        )
+    write_bytes_atomically(destination, deterministic_raw_bytes(payload), overwrite=force)
+    return destination
+
+
+def fingerprint_for_path(path: Path) -> str:
+    resolved = resolve_plan_path(path)
+    header, melody, control, note_text = load_source_bundle(resolved.parent)
+    return source_fingerprint(header, melody, control, note_text)
+
+
 def convert_bv_raw_to_midi(
     bv_path: Path,
     output_path: Path | None = None,
@@ -844,27 +1267,40 @@ def convert_bv_raw_to_midi(
     tolerance: float = 0.01,
     overwrite: bool = True,
     allow_standalone: bool = False,
+    *, source: dict[str, Any] | None = None,
 ) -> Path:
     validate_export_options(ticks_per_beat, velocity, tolerance)
     payload = read_json(bv_path)
-    header = resolve_header(payload, bv_path)
+    if source is None:
+        source = load_source_json(bv_path.parent)
+    header = resolve_header(payload, source)
     tracks = load_tracks(payload)
     segments = build_time_signature_segments(header)
     validate_piece_limits(header, segments)
     max_note_end = validate_notes(tracks, segments, tolerance)
-    melody = sibling_melody(bv_path)
-    control = sibling_control(bv_path)
+    melody = source.get("melody") if isinstance(source.get("melody"), list) else None
+    control = source.get("control") if isinstance(source.get("control"), list) else []
     validate_source_requirement(tracks, melody, allow_standalone)
+    sparse = False
+    plan_path = bv_path.parent / "bv_plan.json"
+    if plan_path.exists():
+        try:
+            _, plan, expected = prepare_plan_render(plan_path, source=source)
+            if payload != expected:
+                raise BvMidiError("Raw does not match sibling plan; rerender before export.")
+            sparse = plan["schemaVersion"] == "bv-plan-v2"
+        except (ValueError, BvMidiError) as exc:
+            raise BvMidiError(f"Unable to verify sibling plan: {exc}") from exc
     validate_melody_aligned_harmonies(
         tracks,
         melody,
         tolerance,
         control,
+        sparse=sparse,
     )
-    effective_tracks = tracks_with_source_lyrics(tracks, melody, control, tolerance)
 
     destination = output_path or (bv_path.parent / "bv.mid")
-    write_midi(destination, header, effective_tracks, ticks_per_beat, velocity, max_note_end, overwrite)
+    write_midi(destination, header, tracks, ticks_per_beat, velocity, max_note_end, overwrite)
     return destination
 
 
@@ -877,9 +1313,16 @@ def confirm_overwrite(path: Path) -> bool:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert bv_raw.json to MIDI.")
-    parser.add_argument("bv_raw_json", help="Path to output/<work_name>/bv_raw.json.")
-    parser.add_argument("-o", "--output", help="Output MIDI path. Default: sibling bv.mid.")
+    parser = argparse.ArgumentParser(description="Render a BV plan or export raw BV data to MIDI.")
+    parser.add_argument("path", help="Raw JSON for MIDI export; work directory or plan JSON for plan operations.")
+    parser.add_argument("-o", "--output", help="Output path. Default: sibling bv.mid, or bv_raw.json with --render-plan.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--render-plan", action="store_true", help="Expand a plan into bv_raw.json.")
+    mode.add_argument(
+        "--print-source-fingerprint", action="store_true",
+        help="Print the source fingerprint before authoring a plan.",
+    )
+    parser.add_argument("--force", action="store_true", help="Replace existing raw data with --render-plan.")
     parser.add_argument(
         "--ticks-per-beat",
         type=int,
@@ -903,13 +1346,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Allow legacy export without source melody; lyric fields remain forbidden.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.force and not args.render_plan:
+        parser.error("--force requires --render-plan.")
+    if args.print_source_fingerprint and args.output:
+        parser.error("--print-source-fingerprint cannot be combined with --output.")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    bv_path = Path(args.bv_raw_json).expanduser()
+    bv_path = Path(args.path).expanduser()
     output_path = Path(args.output).expanduser() if args.output else None
+    if args.print_source_fingerprint or args.render_plan:
+        try:
+            if args.print_source_fingerprint:
+                print(fingerprint_for_path(bv_path))
+            else:
+                destination = render_plan(bv_path, output_path, force=args.force)
+                print(f"Wrote raw BV to {destination}")
+            return 0
+        except (BvMidiError, OSError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     destination = output_path or (bv_path.parent / "bv.mid")
 
     try:
@@ -937,6 +1396,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
+        source = load_source_json(bv_path.parent)
         destination = convert_bv_raw_to_midi(
             bv_path,
             output_path,
@@ -945,12 +1405,13 @@ def main(argv: list[str] | None = None) -> int:
             args.tolerance,
             overwrite=destination_exists,
             allow_standalone=args.allow_standalone,
+            source=source,
         )
     except (BvMidiError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    if args.allow_standalone and sibling_melody(bv_path) is None:
+    if args.allow_standalone and not isinstance(source.get("melody"), list):
         print(
             "WARNING: Exported standalone MIDI without source melody alignment or lyrics.",
             file=sys.stderr,

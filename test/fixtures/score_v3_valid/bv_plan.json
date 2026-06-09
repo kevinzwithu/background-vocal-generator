@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "bv-plan-v1",
+  "sourceFingerprint": "f4b963edf32dfee7294c28b0501b56c45aa896c9ed375dd5eb38303e4e09f4b3",
+  "padPolicy": "sectional",
+  "leadOctaveShift": 0,
+  "harmonyPitches": {
+    "HHA": [64, 64, 64, 64, 64, 64, 64, 64],
+    "HHB": [65, 65, 65, 65, 65, 65, 65, 65],
+    "HHF": [70, 70, 70, 70, 70, 70, 70, 70],
+    "LHA": [57, 57, 57, 57, 57, 57, 57, 57],
+    "LHB": [55, 55, 55, 55, 55, 55, 55, 55],
+    "LHF": [48, 48, 48, 48, 48, 48, 48, 48]
+  },
+  "padBlocks": [
+    {"time": 8, "duration": 2, "pitches": [70, 64, 57, 48]},
+    {"time": 10, "duration": 2, "pitches": [69, 65, 58, 52]}
+  ]
+}
