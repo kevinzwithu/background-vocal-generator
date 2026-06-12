@@ -1,172 +1,121 @@
 ---
 name: background-vocals
-description: Use in this repository after =hs routing selects a concrete background-vocal task. Arrange melody.json and note.txt into an eleven-track bv_raw.json, then validate and revise it.
+description: Arrange a concrete =hs work into bv_plan.json and bv_raw.json with deterministic rendering and v1 scoring; select v2 diagnostics explicitly.
 ---
 
 # Background Vocals
 
-## Purpose
+Use after `rule/modes.md` routes an executable `=hs` request. Read the work's
+`melody.json` and `note.txt`; author `bv_plan.json`, then render `bv_raw.json`.
+For missing or demonstrably stale charts, follow the same-work chord-chart
+prerequisite policy in `rule/modes.md`; do not request a separate mode selection.
 
-Read:
+## Creative contract
 
-```text
-output/<work_name>/melody.json
-output/<work_name>/note.txt
+Write an arrangement that supports the lead with natural lines, useful space,
+and development across phrases and sections. Choose voice combinations and Pad
+activity from the song and the user's intent. Default to v1 plans and scoring;
+use v2 when the request explicitly selects `--evaluation-version v2`.
+
+- Keep LeadDouble complete. Default to the source pitches; only use a necessary,
+  uniform whole-octave shift. All harmony directions reference this adjusted lead.
+- HHA/HHB and LHA/LHB are expressive upper/lower harmony lines; HHF/LHF favor
+  stable chord/common tones. These are roles, not per-note formulas.
+- In v1, each of the six lines covers every source melody onset outside `no_bv`,
+  with the source duration. V2 permits rests; shape its entrances and exits around
+  phrases, with silence-boundary truncation as described below.
+- Upper harmonies stay above the lead, lower harmonies below. Prefer 1–12
+  semitones of separation; brief wider intervals need a musical reason. Assess
+  the combined voicing for clarity rather than crowding every part near the lead.
+- VocalPad1–4 provide independent four-part support, ordered high to low. They
+  need not follow the lead's octave window and may rest freely.
+- Consider each sustained note across all chords it overlaps. Repetition,
+  parallel motion, dissonance and wider spacing require contextual judgment,
+  not automatic removal. `N.C.` permits contextual harmony or rests.
+- Keep LeadDouble complete through `no_bv`. In v1, omit harmony decisions whose
+  source onset is inside `no_bv` and keep Pad notes outside it. In v2, use null
+  for those onsets; renderer also cuts background sustains at the boundary.
+- Keep all sounding pitches within MIDI 12–84 and timing on the source beat/grid
+  contract. Honor explicit user requests about texture and density.
+
+## Plan format
+
+Use exactly these six top-level keys. This example shows the shape for one
+source melody note; obtain the fingerprint with the command below and write
+pitches and Pad timing for the actual song.
+
+```json
+{
+  "schemaVersion": "bv-plan-v1",
+  "sourceFingerprint": "<current source fingerprint>",
+  "padPolicy": "sectional",
+  "leadOctaveShift": 0,
+  "harmonyPitches": {
+    "HHA": [64], "HHB": [67], "HHF": [72],
+    "LHA": [55], "LHB": [52], "LHF": [48]
+  },
+  "padBlocks": [{"time": 0, "duration": 4, "pitches": [72, 67, 60, 48]}]
+}
 ```
 
-Write:
+- V1 arrays index source melody notes in their original order, excluding onsets
+  inside `no_bv`. Every remaining note needs an integer pitch in each array.
+  Default `padPolicy` is `sectional`; use `optional` or `required` when the user's
+  Pad intent calls for it, and satisfy that policy's scoring gates.
+- For explicit v2 work, set `schemaVersion: "bv-plan-v2"` and `padPolicy: "free"`.
+  Arrays index the complete source melody, including `no_bv` onsets. Integers
+  sound, `null` rests, and all onsets inside `no_bv` must be null. Choose density
+  from the music. Preserve an existing plan's schema and indexing rules.
+- `leadOctaveShift` is a whole-octave integer between -72 and 72, applied uniformly
+  to LeadDouble. Sounding pitches use JSON integers within MIDI 12–84.
+- Each Pad block has exactly `time`, `duration`, and four `pitches` ordered from
+  VocalPad1 to VocalPad4, strictly descending. Blocks are sorted, non-overlapping,
+  within the piece and on the source grid. Use an empty array for omitted Pad.
+- Renderer copies source timing and lyrics for aligned voices and calculates note
+  names. V2 cuts background sustains at the first `no_bv` boundary; later notes
+  follow their explicit plan entries. LeadDouble keeps its complete source timing.
+- The fingerprint covers header, melody, control and the exact chart text. Refresh
+  it after source changes, revise the plan and rerender. Validator and exporter
+  verify the plan against the same source and compare its expansion with raw.
 
-```text
-output/<work_name>/bv_raw.json
+## Author and render
+
+```bash
+python3 script/bv_raw_to_midi.py output/<work_name> --print-source-fingerprint
+python3 script/bv_raw_to_midi.py output/<work_name>/bv_plan.json --render-plan
+python3 script/validate_bv_music.py output/<work_name>
 ```
 
-Use this skill only after `rule/modes.md` selects an executable `=hs` task.
+Append `--evaluation-version v2` to validation for v2 work. A v2 plan requires
+that flag; v1 plans and complete old raw can also use v2 diagnostics.
 
-## Hard Boundary
+Obtain the fingerprint, write every musical decision in the plan, then render
+and validate. Use `--force` when deliberately replacing raw after a plan revision.
+Never hand-edit raw, generate pitches with helper code, or optimize a score by
+automatic search. Read-only inspection and existing deterministic tools are allowed.
+Only the requested plan/raw and any prerequisite `note.txt` permitted by
+`rule/modes.md` may persistently change. The prerequisite uses the chord-chart
+workflow and its narrowly scoped temporary compatibility procedure; during
+arrangement and raw validation, do not modify tools or source files to get a pass.
+Report tool limitations when blocked.
 
-This is an AI arrangement task, not deterministic chord-tone conversion.
+## Review and finish
 
-- Read `melody.json` and `note.txt` directly and make the musical decisions.
-- Never create scripts, generated helper code, intermediate summaries, context
-  JSON, arrangement-plan files, or other helper inputs. This prohibition cannot
-  be overridden by a user request during an `=hs` task.
-- Do not create, edit, delete, rename, or temporarily modify code, tests,
-  skills, rules, configuration, or documentation.
-- Existing scripts and read-only inline commands may be used only for
-  inspection, validation, scoring, and report-driven revision.
-- The only persistent file this task may create or modify is the requested
-  `output/<work_name>/bv_raw.json`.
+Fix hard errors in the plan and rerender. In v1, also address delivery blockers
+and meet the default minimum score of 80. Revise until the report passes or no
+supported musical improvement remains. Report the score and remaining blockers.
 
-If existing tools prevent completion or validation, stop and report the
-limitation instead of modifying them.
+V2 uses technical validation and music review. `passed=true` confirms technical
+checks, source fingerprint and raw/plan agreement. Diagnostics localize evidence.
 
-## Input Contract
+For v2, after technical validation request an independent agent review using
+[the review brief](references/music-review.md). Supply the user's musical intent,
+source and final plan/raw; let the reviewer judge these before reading diagnostics.
+If delegation is unavailable, disclose that independent review was not performed.
+Review provides musical recommendations. Resolve hard errors before delivery.
 
-`melody.json` provides the source melody and header. Preserve the full header,
-including `startTime`, `duration`, `timeUnit`, `grid`, `tempoMap`, and
-`timeSignatureMap`.
-
-All `time` and `duration` values are in beats. Stop if `header.timeUnit` is not
-`beats`.
-
-`note.txt` is the required bar-by-bar chord chart. If it is missing or stale,
-stop and ask the user to run `=hx` for the same work first.
-
-Optional `control` spans from the MIDI `control` track may use:
-
-- `verse`, `pre_chorus`, `chorus`, `bridge`
-- `no_bv`
-
-## Output Contract
-
-Write valid JSON with exactly the top-level keys `header` and `tracks`.
-
-Always create these track arrays, even when pad tracks are empty:
-
-```text
-LeadDouble
-HHA HHB HHF
-LHA LHB LHF
-VocalPad1 VocalPad2 VocalPad3 VocalPad4
-```
-
-Every note contains `name`, `midi`, `time`, and `duration`.
-
-For `LeadDouble` and the six melody-aligned harmony tracks, copy the
-corresponding source melody note's optional `lyric` exactly; omit it when the
-source has none. Pad notes never contain `lyric`. Emit no other note fields.
-
-## Arrangement Contract
-
-### LeadDouble and register
-
-- Preserve every source melody note's `time` and `duration`.
-- Normally copy the source pitch exactly.
-- Current `midi_to_json.py` output should already be normalized into a useful
-  harmony register. For legacy or manually edited input only, use the smallest
-  feasible uniform whole-octave shift when necessary.
-- Apply any shift to every `LeadDouble` note, updating both `midi` and `name`.
-  Never shift individual notes independently or use a non-octave correction.
-- Use adjusted `LeadDouble` as the reference for all harmony direction,
-  interval, contour, and spacing decisions.
-- If no single octave shift leaves useful room above and below, stop and report
-  the register conflict.
-
-### Melody-aligned harmony
-
-Outside explicit `no_bv` spans, each of `HHA`, `HHB`, `HHF`, `LHA`, `LHB`, and
-`LHF` must contain exactly one note per source melody note, with matching
-`time`, `duration`, and optional `lyric`.
-
-- These are true harmony lines, not free counter-lines, sparse phrase responses,
-  long pad notes, or bass support.
-- Upper tracks stay above and use a different pitch from adjusted `LeadDouble`.
-- Lower tracks stay below and use a different pitch from adjusted `LeadDouble`.
-- `HHA`, `HHB`, `LHA`, and `LHB` are expressive lines that substantially follow
-  the melody contour, generally 2-4 scale degrees away while fitting the chord.
-  Occasional 5th-degree spacing is allowed when it improves the line. Do not let
-  paired expressive lines duplicate for long stretches or collapse into one
-  repeated pitch for most notes in a measure.
-- `HHF` and `LHF` are flatter melody-aligned lines that may favor repeated chord
-  tones and common tones, but they are not pads.
-
-### Pads and sections
-
-- Arrange `VocalPad1-4` as smooth soprano/alto/tenor/bass-like choir support
-  with controlled spacing, natural inversions, common tones, and contrary or
-  oblique motion. They may rest when pads would clutter the arrangement; avoid
-  rigid parallel blocks.
-- `verse` favors intimate, narrow, common-tone voicing and restrained pads.
-- `pre_chorus` builds lift, directional motion, and controlled width.
-- `chorus` supports the hook with fuller voicing, stronger upper harmonies, and
-  useful pad density.
-- `bridge` may contrast register, voicing color, and contour while remaining
-  singable.
-- In `no_bv` spans, leave all harmony and pad tracks silent; `LeadDouble`
-  remains complete.
-
-### Global music rules
-
-- Every harmony or pad note must fit the active chord from `note.txt`.
-- In `N.C.` spans outside `no_bv`, harmony tracks remain complete using nearby
-  tonal context or conservative consonance; pads may rest.
-- Keep every note within MIDI `12..84` (`C0..C6`).
-- Use beats and align notes to the active `1/32_bar` grid or triplets.
-- Do not cross bar boundaries unless the duration intentionally sustains across
-  the boundary.
-
-## Workflow
-
-1. Read and validate `melody.json`, `note.txt`, header, controls, and register.
-2. Copy the header and create all eleven track arrays.
-3. Write `LeadDouble`, applying a uniform octave fallback only when required.
-4. Arrange the six complete melody-aligned harmony tracks.
-5. Arrange the four pad tracks and apply section guidance.
-6. Strip disallowed fields and write `output/<work_name>/bv_raw.json`.
-7. Run:
-
-   ```bash
-   python3 script/validate_bv_music.py output/<work_name>
-   ```
-
-8. Fix hard errors. Revise clear musical problems or a score below the default
-   threshold, rerunning validation for up to three revision rounds.
-9. Confirm no non-output repository file changed during the task.
-
-Do not replace the arrangement with script-generated content.
-
-## Completion Gate
-
-Do not deliver `bv_raw.json` unless:
-
-- JSON shape, required tracks, allowed fields, inherited lyrics, header, range,
-  beat/grid alignment, and chord fit satisfy the contracts above.
-- `LeadDouble` timing is exact and its pitch is either exact or one uniform
-  whole-octave shift.
-- Outside `no_bv`, all six harmony tracks align one-to-one with source melody
-  timing and stay on the required side of adjusted `LeadDouble`.
-- Expressive harmony lines retain meaningful contour.
-- `script/validate_bv_music.py` passes hard validation.
-- No repository file other than the requested `bv_raw.json` changed.
-
-Mention any remaining intentional soft warnings in the final response.
+Revise only for supported musical reasons, rerender and revalidate after changes,
+and request another review only for materially changed passages. Stop when there
+is no evidence-backed improvement to make; surface unresolved musical differences.
+Deliver links to plan/raw, the technical result, review status, and significant
+intentional exceptions. Do not claim listening review unless audio was heard.
