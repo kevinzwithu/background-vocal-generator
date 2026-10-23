@@ -28,6 +28,14 @@ If the user is only discussing requirements, rules, documentation, prompts,
 product design, or implementation details, handle the request as `=pt` and do
 not load the mode skill, even when the message contains `=hx` or `=hs`.
 
+## Chart overwrite policy for `=hx` and `=hs`
+
+Create a missing `note.txt` without prompting. Preserve existing manual chart
+edits; if regeneration would overwrite them and replacement is not already
+authorized, ask only about that overwrite and continue independent source
+inspection. Use `--force` only when deliberately replacing a chart under this
+policy; existing authorization does not require another confirmation.
+
 ## Chord-chart prerequisite for `=hs`
 
 An executable `=hs` request also authorizes the chord-chart workflow for the same
@@ -37,10 +45,9 @@ the user to select `=hx` again. Reuse a chart whose content matches the current
 source; confirm staleness by comparing chart content with the source.
 
 This prerequisite may persistently create or refresh that work's `note.txt`.
-Preserve existing manual chart edits; if regeneration would overwrite them and
-replacement is not already authorized, ask only about that overwrite and continue
-independent source inspection. If required source data is missing or invalid,
-report the specific missing prerequisite; do not invent a chart or keep retrying.
+Apply the shared chart overwrite policy above. If required source data is missing
+or invalid, report the specific missing prerequisite; do not invent a chart or
+keep retrying.
 The chord-chart skill's temporary compatibility procedure remains applicable
 only under its stated conditions. This exception does not authorize persistent
 changes to source data, converter code, other works or unrelated files.

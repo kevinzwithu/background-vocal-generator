@@ -40,6 +40,10 @@ use v2 when the request explicitly selects `--evaluation-version v2`.
 
 ## Plan format
 
+The plan's `schemaVersion` controls indexing, rests, Pad policy and `no_bv`
+rendering. `--evaluation-version` selects validation only: v2 diagnostics on an
+existing v1 plan retain that plan's v1 rules.
+
 Use exactly these six top-level keys. This example shows the shape for one
 source melody note; obtain the fingerprint with the command below and write
 pitches and Pad timing for the actual song.
